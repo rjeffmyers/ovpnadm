@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ] && [ ! -f /etc/openvpn/server/server.conf ]; then
+  echo "ovpnadm installed. Run 'sudo ovpnadm' to set up the VPN server."
+fi
+exit 0

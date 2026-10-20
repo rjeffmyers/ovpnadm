@@ -1,0 +1,625 @@
+#!/bin/bash
+#
+# ovpnadm - manage an OpenVPN server whose users are local Linux accounts
+#
+# Run without arguments for the menu. Commands:
+#   install [-r backup.tgz] [-f]    set up or reconfigure the server from /etc/ovpnadm.conf
+#   status                          connected clients
+#   users [--names]                 VPN users (members of the VPN group)
+#   add <user> [--password-stdin]   add a VPN user; new accounts get a random password
+#   remove <user> [--purge]         take a user off the VPN; --purge deletes a VPN-only account
+#   passwd <user> [--password-stdin] set a new password (random unless given on stdin)
+#   kick <user>                     disconnect a user's sessions now
+#   client list                     client certificates and their expiry  (CLIENT_CERTS=yes)
+#   client add <name> [days] [file] issue a certificate and write its .ovpn profile
+#   client renew <name> [days] [file] replace a certificate (the old profile stops working)
+#   client revoke <name>            revoke a certificate and drop its sessions
+#   profile [file]                  write the shared .ovpn profile          (CLIENT_CERTS=no)
+#   rotate-key                      new tls-crypt key: every issued .ovpn stops working
+#   log [lines] [-f]                server log
+#   auth-log [lines]                logins and failed logins
+#   whitelist [add <ip> [comment] | remove <ip>]   source IP whitelist (needs allowvpn)
+#   backup <file>                   save the keys, so a rebuilt server accepts existing profiles
+#   config [set <KEY> <value>]      show or change settings
+#
+# Users log in with their Linux username and password and must be in the VPN
+# group. With CLIENT_CERTS=yes each person also needs their own .ovpn, whose
+# certificate expires after CERT_DAYS; with CLIENT_CERTS=no everyone shares one.
+
+VERSION=1.0.0
+
+CONF_FILE=${OVPNADM_CONF:-/etc/ovpnadm.conf}
+LIBDIR=${OVPNADM_LIB:-/usr/lib/ovpnadm}
+D=${OVPNADM_DIR:-/etc/openvpn/server}     # overridable for testing
+PKI=$D/easy-rsa/pki
+SERVER_CONF=$D/server.conf
+UNIT=openvpn-server@server
+STATUS=${OVPNADM_STATUS:-/var/log/openvpn/status.log}
+MGMT=${OVPNADM_MGMT:-/run/openvpn-server/mgmt.sock}
+KEYS="ca.crt server.crt server.key tc.key crl.pem easy-rsa"
+CONF_KEYS="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
+
+die() { echo "ovpnadm: $*" >&2; exit 1; }
+say() { echo "==> $*"; }
+usage() { sed -n '/^# Run without/,/^#$/s/^# \{0,1\}//p' "$0"; exit 1; }
+
+# --- settings ---------------------------------------------------------------
+
+default_if() { ip -4 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}'; }
+if_addr() { ip -4 -o addr show "$1" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+# First directly connected network that is not on the internet-side interface or a tunnel
+default_lan() { ip -4 route show proto kernel scope link 2>/dev/null | awk -v ext="$1" '$0 !~ "dev (" ext "|tun[0-9]*)( |$)" {print $1; exit}'; }
+
+load_conf() {
+  EXT_IF="" PUBLIC_IP="" LAN_NET="" VPN_POOL="" PORT="" VPN_GROUP="" PROFILE_NAME="" CLIENT_CERTS="" CERT_DAYS=""
+  # shellcheck disable=SC1090
+  [[ -f $CONF_FILE ]] && . "$CONF_FILE"
+  EXT_IF=${EXT_IF:-$(default_if)}
+  PUBLIC_IP=${PUBLIC_IP:-$(if_addr "$EXT_IF")}
+  LAN_NET=${LAN_NET:-$(default_lan "$EXT_IF")}
+  VPN_POOL=${VPN_POOL:-10.8.0.0/24}
+  PORT=${PORT:-1194}
+  VPN_GROUP=${VPN_GROUP:-vpnusers}
+  PROFILE_NAME=${PROFILE_NAME:-$(hostname -s)-vpn}
+  CLIENT_CERTS=${CLIENT_CERTS:-yes}
+  CERT_DAYS=${CERT_DAYS:-90}
+}
+
+cmd_config() {
+  if [[ ${1:-} == set ]]; then
+    local key=${2:-} val=${3-}
+    [[ " $CONF_KEYS " == *" $key "* ]] || die "unknown setting '$key' (one of: $CONF_KEYS)"
+    [[ $val =~ ^[A-Za-z0-9._/:-]*$ ]] || die "invalid value for $key: '$val'"
+    [[ $key != CLIENT_CERTS || $val =~ ^(yes|no)$ ]] || die "CLIENT_CERTS must be yes or no"
+    [[ $key != CERT_DAYS || $val =~ ^[1-9][0-9]{0,4}$ ]] || die "CERT_DAYS must be a number of days"
+    [[ -f $CONF_FILE ]] || : > "$CONF_FILE"
+    if grep -q "^$key=" "$CONF_FILE"; then
+      sed -i "s|^$key=.*|$key=$val|" "$CONF_FILE"
+    else
+      echo "$key=$val" >> "$CONF_FILE"
+    fi
+    return
+  fi
+  [[ -z ${1:-} ]] || usage
+  local k
+  for k in $CONF_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done
+}
+
+# --- helpers ----------------------------------------------------------------
+
+installed() { [[ -f $SERVER_CONF && -f $D/server.crt ]]; }
+need_installed() { installed || die "the server is not set up yet: run 'ovpnadm install'"; }
+# Mode of the running config: per-client certificates or one shared profile
+certs_mode() { ! grep -q '^verify-client-cert none' "$SERVER_CONF" 2>/dev/null; }
+
+# "192.168.10.0/24" -> "192.168.10.0 255.255.255.0"
+netmask() {
+  local n=${1%/*} b=${1#*/} m
+  [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]] && (( b >= 1 && b <= 32 )) || die "bad network: '$1' (want a.b.c.d/nn)"
+  m=$(( (0xffffffff << (32 - b)) & 0xffffffff ))
+  echo "$n $(( m >> 24 )).$(( m >> 16 & 255 )).$(( m >> 8 & 255 )).$(( m & 255 ))"
+}
+
+valid_user() { [[ $1 =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]] || die "invalid user name: '$1'"; }
+valid_client() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$ && $1 != server ]] || die "invalid client name: '$1'"; }
+random_pw() { tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom 2>/dev/null | head -c 20; }
+
+# Password from stdin (one line) if --password-stdin, else a random one
+get_pw() {
+  local pw
+  if [[ ${1:-} == --password-stdin ]]; then
+    IFS= read -r pw || true
+    (( ${#pw} >= 8 )) || die "password must be at least 8 characters"
+    echo "$pw"
+  else
+    random_pw
+  fi
+}
+
+set_pw() { printf '%s:%s\n' "$1" "$2" | chpasswd || die "could not set password for $1"; }
+
+group_members() { getent group "$VPN_GROUP" | cut -d: -f4 | tr ',' '\n' | grep -v '^$' | sort; }
+
+human() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u); i = 1; while (b >= 1024 && i < 5) { b /= 1024; i++ } printf(i == 1 ? "%d%s" : "%.1f%s", b, u[i]) }'; }
+
+# Send one command to the management interface and print the reply (without
+# the CRs and >INFO notifications), reading until it ends with END/SUCCESS/ERROR
+mgmt() {
+  [[ -S $MGMT ]] || die "management socket $MGMT not found (re-run 'ovpnadm install' to enable it)"
+  local line
+  coproc MGMT_NC { nc -U "$MGMT" 2>/dev/null; }
+  printf '%s\n' "$1" >&"${MGMT_NC[1]}"
+  while IFS= read -r -t 5 line <&"${MGMT_NC[0]}"; do
+    line=${line%$'\r'}
+    [[ $line == '>'* ]] && continue
+    echo "$line"
+    [[ $line == END || $line == SUCCESS:* || $line == ERROR:* ]] && break
+  done
+  printf 'quit\n' >&"${MGMT_NC[1]}" 2>/dev/null
+  wait "$MGMT_NC_PID" 2>/dev/null
+  return 0
+}
+
+# CLIENT_LIST lines (status-version 2): live from the management socket, else the status file
+client_lines() {
+  if [[ -S $MGMT ]]; then mgmt "status 2"; else cat "$STATUS" 2>/dev/null; fi | grep '^CLIENT_LIST,'
+}
+
+# Disconnect sessions whose login user ($1 == user) or certificate ($1 == cert) matches $2
+drop_sessions() {
+  [[ -S $MGMT ]] || return 1
+  local field=10 n=0 addr
+  [[ $1 == cert ]] && field=2
+  for addr in $(client_lines | awk -F, -v f=$field -v v="$2" '$f == v {print $3}'); do
+    mgmt "kill $addr" | grep -q SUCCESS && (( n++ ))
+  done
+  (( n > 0 ))
+}
+
+plugin_path() { ls /usr/lib/*/openvpn/plugins/openvpn-plugin-auth-pam.so /usr/lib/openvpn/openvpn-plugin-auth-pam.so 2>/dev/null | head -1; }
+
+easyrsa() { ( cd $D/easy-rsa && ./easyrsa --batch "$@" ) >/dev/null 2>&1; }
+
+# Regenerate the revocation list; OpenVPN re-reads it on every connection
+update_crl() {
+  easyrsa gen-crl || die "could not generate the CRL"
+  install -m 644 $PKI/crl.pem $D/crl.pem
+}
+
+# Write a client profile; with a client name, embed that client's certificate and key
+write_profile() {
+  local out=$1 name=${2:-} port
+  port=$(awk '$1 == "port" {print $2}' "$SERVER_CONF")
+  ( umask 077
+    cat > "$out" <<EOF
+client
+dev tun
+proto udp
+remote $PUBLIC_IP ${port:-1194}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+verify-x509-name server name
+auth-user-pass
+auth SHA256
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+reneg-sec 0
+verb 3
+<ca>
+$(cat $D/ca.crt)
+</ca>
+<tls-crypt>
+$(cat $D/tc.key)
+</tls-crypt>
+EOF
+    if [[ -n $name ]]; then
+      printf '<cert>\n%s\n</cert>\n<key>\n%s\n</key>\n' \
+        "$(openssl x509 -in "$PKI/issued/$name.crt")" "$(cat "$PKI/private/$name.key")" >> "$out"
+    fi
+  ) || die "could not write $out"
+  [[ -n ${SUDO_USER:-} ]] && chown "$SUDO_USER": "$out" 2>/dev/null
+  echo "wrote $out (connects to $PUBLIC_IP:${port:-1194}/udp)"
+}
+
+# --- install ----------------------------------------------------------------
+
+cmd_install() {
+  local restore="" force=""
+  while (( $# )); do
+    case $1 in
+      -r) restore=${2:-}; [[ -f $restore ]] || die "backup file not found: '$restore'"; shift 2 ;;
+      -f) force=1; shift ;;
+      *) usage ;;
+    esac
+  done
+  [[ -n $EXT_IF ]] || die "EXT_IF is not set and there is no default route"
+  [[ -n $PUBLIC_IP ]] || die "PUBLIC_IP is not set and $EXT_IF has no IPv4 address"
+  [[ -n $LAN_NET ]] || die "LAN_NET is not set: ovpnadm config set LAN_NET a.b.c.d/nn"
+  [[ $PORT =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "bad PORT: $PORT"
+  [[ $CLIENT_CERTS =~ ^(yes|no)$ ]] || die "CLIENT_CERTS must be yes or no"
+  if installed && [[ -z $force ]]; then
+    if certs_mode && [[ $CLIENT_CERTS == no ]]; then
+      die "the server uses per-client certificates and CLIENT_CERTS=no would switch to one shared profile; use -f to do it"
+    elif ! certs_mode && [[ $CLIENT_CERTS == yes ]]; then
+      die "the server uses a shared profile and CLIENT_CERTS=yes would make every existing .ovpn stop working; use -f to do it (or: ovpnadm config set CLIENT_CERTS no)"
+    fi
+  fi
+  local pool_net pool_mask lan_net lan_mask plugin
+  read -r pool_net pool_mask <<< "$(netmask "$VPN_POOL")" || exit 1
+  read -r lan_net lan_mask <<< "$(netmask "$LAN_NET")" || exit 1
+  say "clients connect to $PUBLIC_IP:$PORT/udp, get addresses from $VPN_POOL, reach $LAN_NET"
+
+  if ! command -v openvpn >/dev/null || [[ ! -d /usr/share/easy-rsa ]]; then
+    say "installing openvpn and easy-rsa"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openvpn easy-rsa >/dev/null || die "apt-get failed"
+  fi
+  plugin=$(plugin_path)
+  [[ -n $plugin ]] || die "OpenVPN PAM plugin not found"
+  systemctl disable --now openvpn.service >/dev/null 2>&1 || true   # the old all-configs unit
+  mkdir -p $D /var/lib/openvpn /var/log/openvpn
+
+  if [[ -n $restore ]]; then
+    tar tzf "$restore" server.key >/dev/null 2>&1 || die "$restore is not an ovpnadm key backup"
+    say "restoring keys from $restore"
+    [[ -f $D/server.crt ]] && cp -a $D "$D.bak-$(date +%Y%m%d-%H%M%S)"
+    tar xzf "$restore" -C $D --no-same-owner || die "could not unpack $restore"
+  elif [[ -f $D/server.crt && -f $D/tc.key ]]; then
+    say "keeping the existing keys in $D"
+  else
+    say "creating a new CA and server certificate"
+    rm -rf $D/easy-rsa
+    cp -r /usr/share/easy-rsa $D/easy-rsa
+    cat > $D/easy-rsa/vars <<'EOF'
+set_var EASYRSA_ALGO     ec
+set_var EASYRSA_CURVE    prime256v1
+set_var EASYRSA_DIGEST   sha256
+set_var EASYRSA_CA_EXPIRE   3650
+set_var EASYRSA_CERT_EXPIRE 3650
+set_var EASYRSA_CRL_DAYS    3650
+EOF
+    easyrsa init-pki &&
+      EASYRSA_REQ_CN="$(hostname -s)-vpn-ca" easyrsa build-ca nopass &&
+      easyrsa build-server-full server nopass || die "easy-rsa failed"
+    cp $PKI/{ca.crt,issued/server.crt,private/server.key} $D/
+    openvpn --genkey secret $D/tc.key
+  fi
+  chmod 600 $D/ca.crt $D/server.crt $D/server.key $D/tc.key
+  update_crl
+
+  local auth
+  if [[ $CLIENT_CERTS == yes ]]; then
+    auth="# Each client needs its own certificate (ovpnadm client add) AND a Linux
+# username/password. Expired or revoked certificates are refused.
+crl-verify crl.pem
+plugin $plugin openvpn"
+  else
+    auth="# Username/password auth against local users, no client certificates
+verify-client-cert none
+username-as-common-name
+plugin $plugin openvpn
+duplicate-cn"
+  fi
+
+  say "writing $SERVER_CONF"
+  cat > "$SERVER_CONF" <<EOF
+# Written by ovpnadm - changes here are overwritten by "ovpnadm install".
+# Edit /etc/ovpnadm.conf instead.
+#
+# Remote access to $LAN_NET, authenticated by local Linux accounts
+# (PAM service /etc/pam.d/openvpn, members of group "$VPN_GROUP").
+port $PORT
+proto udp
+dev tun
+topology subnet
+server $pool_net $pool_mask
+
+# Split tunnel: only the LAN goes over the VPN
+push "route $lan_net $lan_mask"
+
+ca ca.crt
+cert server.crt
+key server.key
+dh none
+tls-crypt tc.key
+tls-version-min 1.2
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
+auth SHA256
+reneg-sec 0
+
+$auth
+
+keepalive 10 120
+user nobody
+group nogroup
+persist-key
+persist-tun
+explicit-exit-notify 1
+status $STATUS 30
+status-version 2
+management $MGMT unix
+management-client-user root
+verb 3
+EOF
+
+  cat > /etc/pam.d/openvpn <<EOF
+# OpenVPN logins (written by ovpnadm): local Linux password, and the account
+# must be in group $VPN_GROUP
+auth     required  pam_succeed_if.so user ingroup $VPN_GROUP quiet_success
+auth     required  pam_unix.so
+account  required  pam_unix.so
+EOF
+  getent group "$VPN_GROUP" >/dev/null || groupadd "$VPN_GROUP"
+
+  echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/60-ovpnadm.conf
+  sysctl -q -w net.ipv4.ip_forward=1
+
+  systemctl enable $UNIT >/dev/null 2>&1
+  systemctl restart $UNIT
+  sleep 2
+  systemctl is-active --quiet $UNIT || die "the server failed to start: journalctl -u $UNIT"
+  say "$UNIT running and enabled at boot"
+  echo
+  if [[ $CLIENT_CERTS == yes ]]; then
+    echo "Next: add users (ovpnadm add <user>) and give each person a profile (ovpnadm client add <name>)."
+  else
+    echo "Next: add users (ovpnadm add <user>) and give clients the profile (ovpnadm profile)."
+  fi
+  echo "Your firewall must allow UDP $PORT in and forward $VPN_POOL to $LAN_NET, and"
+  echo "hosts on $LAN_NET need a route back to $VPN_POOL (or NAT it)."
+}
+
+# --- users ------------------------------------------------------------------
+
+cmd_users() {
+  local names
+  names=$(group_members)
+  if [[ ${1:-} == --names ]]; then
+    [[ -n $names ]] && echo "$names"
+    return 0
+  fi
+  [[ -n $names ]] || { echo "No VPN users (group $VPN_GROUP is empty)."; return 0; }
+  local online last u state
+  online=$(client_lines | awk -F, '{print $10}' | sort | uniq -c | awk '{print $2 ":" $1}')
+  last=$(journalctl -u $UNIT --no-pager -q -o short-iso -g 'authentication succeeded for username' 2>/dev/null |
+         sed -n "s/^\([^ ]*\) .*for username '\([^']*\)'.*/\2 \1/p" | awk '{t[$1] = $2} END {for (u in t) print u, t[u]}')
+  {
+    echo "USER STATE SESSIONS LAST-LOGIN"
+    while read -r u; do
+      case $(passwd -S "$u" 2>/dev/null | awk '{print $2}') in
+        P) state=active ;; L) state=locked ;; NP) state=no-password ;; *) state=no-account ;;
+      esac
+      printf '%s %s %s %s\n' "$u" "$state" \
+        "$(grep -m1 "^$u:" <<< "$online" | cut -d: -f2 | grep . || echo 0)" \
+        "$(awk -v u="$u" '$1 == u {print substr($2, 1, 16)}' <<< "$last" | grep . || echo never)"
+    done <<< "$names"
+  } | column -t
+}
+
+cmd_add() {
+  local u=${1:-}; [[ -n $u ]] || usage
+  valid_user "$u"; shift
+  local pw
+  if id "$u" >/dev/null 2>&1; then
+    group_members | grep -qx "$u" && { echo "$u is already a VPN user"; return 0; }
+    usermod -aG "$VPN_GROUP" "$u" || die "could not add $u to $VPN_GROUP"
+    if [[ ${1:-} == --password-stdin ]]; then
+      pw=$(get_pw "$@") || exit 1
+      set_pw "$u" "$pw"
+      echo "added existing user $u to the VPN with the new password"
+    else
+      echo "added existing user $u to the VPN (password unchanged)"
+    fi
+  else
+    pw=$(get_pw "$@") || exit 1
+    useradd -M -s /usr/sbin/nologin -G "$VPN_GROUP" "$u" || die "could not create $u"
+    set_pw "$u" "$pw"
+    echo "created VPN user $u (no shell access)"
+    [[ ${1:-} == --password-stdin ]] || echo "password: $pw"
+  fi
+}
+
+cmd_remove() {
+  local u=${1:-}; [[ -n $u ]] || usage
+  valid_user "$u"
+  id "$u" >/dev/null 2>&1 || die "no such user: $u"
+  if group_members | grep -qx "$u"; then
+    gpasswd -d "$u" "$VPN_GROUP" >/dev/null || die "could not remove $u from $VPN_GROUP"
+    echo "removed $u from the VPN"
+  fi
+  drop_sessions user "$u" && echo "disconnected $u's sessions"
+  if [[ ${2:-} == --purge ]]; then
+    local shell uid
+    shell=$(getent passwd "$u" | cut -d: -f7); uid=$(id -u "$u")
+    [[ $shell == */nologin || $shell == */false ]] && (( uid >= 1000 )) ||
+      die "$u has a login shell or is a system account; not deleting it"
+    userdel "$u" || die "could not delete $u"
+    echo "deleted account $u"
+  fi
+  return 0
+}
+
+cmd_passwd() {
+  local u=${1:-}; [[ -n $u ]] || usage
+  valid_user "$u"; shift
+  id "$u" >/dev/null 2>&1 || die "no such user: $u"
+  local pw
+  pw=$(get_pw "$@") || exit 1
+  set_pw "$u" "$pw"
+  echo "password changed for $u"
+  [[ ${1:-} == --password-stdin ]] || echo "password: $pw"
+}
+
+cmd_kick() {
+  local u=${1:-}; [[ -n $u ]] || usage
+  valid_user "$u"
+  [[ -S $MGMT ]] || die "management socket $MGMT not found (re-run 'ovpnadm install' to enable it)"
+  drop_sessions user "$u" && echo "disconnected $u" || die "$u is not connected"
+}
+
+# --- client certificates ----------------------------------------------------
+
+# name, state, expiry date, days left - for valid certificates (server excluded)
+client_certs() {
+  local now; now=$(date +%s)
+  awk -F'\t' '$1 == "V" { sub(/.*\/CN=/, "", $6); sub(/\/.*/, "", $6); if ($6 != "server") print $6, $2 }' $PKI/index.txt 2>/dev/null |
+  while read -r name exp; do
+    local t; t=$(date -d "20${exp:0:2}-${exp:2:2}-${exp:4:2} ${exp:6:2}:${exp:8:2}:${exp:10:2} UTC" +%s)
+    local left=$(( (t - now + 86399) / 86400 ))
+    printf '%s %s %s %s\n' "$name" "$( (( t > now )) && echo valid || echo EXPIRED)" "$(date -d "@$t" +%F)" "$left"
+  done | sort
+}
+
+cmd_client() {
+  need_installed
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list)
+      local rows; rows=$(client_certs)
+      [[ -n $rows ]] || { echo "No client certificates."; return 0; }
+      { echo "CLIENT STATE EXPIRES DAYS-LEFT"; echo "$rows"; } | column -t
+      ;;
+    add|renew)
+      local name=${1:-} days=${2:-$CERT_DAYS} out=${3:-}
+      [[ -n $name ]] || usage
+      valid_client "$name"
+      [[ $days =~ ^[1-9][0-9]{0,4}$ ]] || die "days must be a number"
+      certs_mode || die "the server uses one shared profile (CLIENT_CERTS=no); use 'ovpnadm profile'"
+      local exists=""; [[ -f $PKI/issued/$name.crt ]] && exists=1
+      if [[ $sub == add && -n $exists ]]; then
+        die "client $name already has a certificate; use 'client renew $name' to replace it"
+      fi
+      if [[ -n $exists ]]; then
+        easyrsa revoke "$name" || die "could not revoke the old certificate for $name"
+        drop_sessions cert "$name" || true
+      fi
+      EASYRSA_CERT_EXPIRE=$days easyrsa build-client-full "$name" nopass || die "could not issue a certificate for $name"
+      update_crl
+      echo "issued certificate $name, valid $days days (until $(date -d "+$days days" +%F))"
+      [[ -n $exists ]] && echo "the previous certificate for $name is revoked"
+      write_profile "${out:-$name.ovpn}" "$name"
+      ;;
+    revoke)
+      local name=${1:-}; [[ -n $name ]] || usage
+      valid_client "$name"
+      [[ -f $PKI/issued/$name.crt ]] || die "no certificate for client $name"
+      easyrsa revoke "$name" || die "could not revoke $name"
+      update_crl
+      echo "revoked $name - its profile no longer works"
+      drop_sessions cert "$name" && echo "disconnected $name"
+      return 0
+      ;;
+    *) usage ;;
+  esac
+}
+
+cmd_profile() {
+  need_installed
+  certs_mode && die "each client needs its own profile (CLIENT_CERTS=yes): use 'ovpnadm client add <name>'"
+  write_profile "${1:-$PROFILE_NAME.ovpn}"
+}
+
+# A new tls-crypt key: no profile issued before this can even reach the server
+cmd_rotate_key() {
+  need_installed
+  cp -p $D/tc.key "$D/tc.key.old-$(date +%Y%m%d-%H%M%S)"
+  openvpn --genkey secret $D/tc.key.new && chmod 600 $D/tc.key.new && mv $D/tc.key.new $D/tc.key ||
+    die "could not create a new key"
+  systemctl restart $UNIT
+  sleep 2
+  systemctl is-active --quiet $UNIT || die "the server failed to start: journalctl -u $UNIT"
+  echo "new tls-crypt key in place; all clients were disconnected and every old .ovpn is retired"
+  if certs_mode; then
+    echo "issue new profiles with: ovpnadm client renew <name>"
+  else
+    echo "write the new shared profile with: ovpnadm profile"
+  fi
+}
+
+# --- status and logs --------------------------------------------------------
+
+cmd_status() {
+  need_installed
+  systemctl is-active --quiet $UNIT || { echo "The VPN server is NOT running ($UNIT)."; return 1; }
+  local src lines n
+  if [[ -S $MGMT ]]; then src="live"; else src="as of $(date -r "$STATUS" '+%H:%M:%S' 2>/dev/null)"; fi
+  lines=$(client_lines)
+  n=$(grep -c . <<< "$lines")
+  echo "Server running on port $(awk '$1 == "port" {print $2}' "$SERVER_CONF"), $(certs_mode && echo "per-client certificates" || echo "shared profile") - $n client(s) connected ($src)"
+  (( n > 0 )) || return 0
+  echo
+  {
+    echo "USER CLIENT FROM VPN-IP CONNECTED-SINCE RECEIVED SENT"
+    while IFS=, read -r _ cn real vip _ rx tx since _ user _; do
+      [[ $user == UNDEF || -z $user ]] && user=$cn
+      printf '%s %s %s %s %s %s %s\n' "$user" "$( [[ $cn == "$user" ]] && echo - || echo "$cn")" \
+        "${real%:*}" "$vip" "${since// /_}" "$(human "$rx")" "$(human "$tx")"
+    done <<< "$lines"
+  } | column -t
+}
+
+cmd_log() {
+  local n=200 follow=""
+  for a in "$@"; do
+    case $a in -f) follow=-f ;; *[!0-9]*|"") usage ;; *) n=$a ;; esac
+  done
+  journalctl -u $UNIT --no-pager -n "$n" $follow
+}
+
+# Successful and failed logins. A failure is logged by the PAM plugin (user
+# name) and then by OpenVPN (client certificate/address); pair the two.
+cmd_auth_log() {
+  local n=${1:-50}
+  [[ $n =~ ^[0-9]+$ ]] || usage
+  echo "TIME                 RESULT  USER                 CLIENT               FROM"
+  journalctl -u $UNIT --no-pager -q -o short-iso \
+    -g 'authentication succeeded for username|failed to authenticate|Username/Password verification failed|VERIFY ERROR' 2>/dev/null |
+  awk '
+    # "[cert/]1.2.3.4:5678" -> sets CLIENT and FROM
+    function peer(l,   f, i, n, p) {
+      CLIENT = "-"; FROM = ""; n = split(l, f, " ")
+      for (i = 4; i <= n; i++) if (f[i] ~ /^([^ ]+\/)?[0-9.]+:[0-9]+$/) {
+        p = f[i]; sub(/:[0-9]+$/, "", p)
+        if (p ~ /\//) { CLIENT = p; sub(/\/.*/, "", CLIENT); sub(/.*\//, "", p) }
+        FROM = p; return
+      }
+    }
+    function out(t, r, u) { printf "%-20s %-7s %-20s %-20s %s\n", substr(t, 1, 19), r, u, CLIENT, FROM }
+    / failed to authenticate/ { match($0, /user .[^\047]*\047/); fu = substr($0, RSTART + 6, RLENGTH - 7); next }
+    /authentication succeeded/ { match($0, /username .[^\047]*\047/); peer($0); out($1, "OK", substr($0, RSTART + 10, RLENGTH - 11)); next }
+    /verification failed/ { peer($0); out($1, "FAILED", fu == "" ? "?" : fu); fu = ""; next }
+    /VERIFY ERROR/ { peer($0); r = $0; sub(/.*error=/, "", r); CLIENT = "cert: " r; out($1, "REFUSED", "-") }
+  ' | tail -n "$n"
+}
+
+# --- whitelist and backup ---------------------------------------------------
+
+cmd_whitelist() {
+  command -v allowvpn >/dev/null || die "no whitelist tool: this needs 'allowvpn' (see README)"
+  case ${1:-} in
+    "")     allowvpn -l ;;
+    add)    [[ -n ${2:-} ]] || usage; allowvpn "$2" "${@:3}" ;;
+    remove) [[ -n ${2:-} ]] || usage; allowvpn -r "$2" ;;
+    *)      usage ;;
+  esac
+}
+
+cmd_backup() {
+  local out=${1:-}; [[ -n $out ]] || usage
+  need_installed
+  # shellcheck disable=SC2086
+  ( umask 077; cd $D && tar czf - $KEYS ) > "$out" || die "could not write $out"
+  chmod 600 "$out"
+  echo "wrote $out"
+  echo "It holds the server's private keys - keep it safe. Restore with: ovpnadm install -r $out"
+}
+
+# --- main -------------------------------------------------------------------
+
+[[ ${1:-} == --version ]] && { echo "ovpnadm $VERSION"; exit 0; }
+[[ $EUID -eq 0 ]] || die "must be run as root (sudo ovpnadm)"
+load_conf
+
+cmd=${1:-menu}; shift || true
+case $cmd in
+  menu)       command -v dialog >/dev/null || die "the menu needs 'dialog' (apt install dialog)"
+              exec "$LIBDIR/tui" ;;
+  install)    cmd_install "$@" ;;
+  status)     cmd_status ;;
+  users)      cmd_users "$@" ;;
+  add)        cmd_add "$@" ;;
+  remove)     cmd_remove "$@" ;;
+  passwd)     cmd_passwd "$@" ;;
+  kick)       cmd_kick "$@" ;;
+  client)     cmd_client "$@" ;;
+  profile)    cmd_profile "$@" ;;
+  rotate-key) cmd_rotate_key ;;
+  log)        cmd_log "$@" ;;
+  auth-log)   cmd_auth_log "$@" ;;
+  whitelist)  cmd_whitelist "$@" ;;
+  backup)     cmd_backup "$@" ;;
+  config)     cmd_config "$@" ;;
+  -h|--help|help) usage ;;
+  *)          usage ;;
+esac

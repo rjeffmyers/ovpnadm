@@ -1,0 +1,262 @@
+#!/bin/bash
+#
+# ovpnadm menu (dialog). Started by "ovpnadm" with no arguments; every action
+# runs an ovpnadm command, so the menu holds no logic of its own.
+
+ADM=${OVPNADM:-/usr/sbin/ovpnadm}
+TITLE="ovpnadm - OpenVPN on $(hostname -s)"
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"; clear' EXIT
+
+# dialog writes the answer to stderr; swap so it can be captured
+dlg() { dialog --backtitle "$TITLE" "$@" 3>&1 1>&2 2>&3; }
+
+# Run an ovpnadm command and show its output (title, then the command's arguments)
+show() {
+  local title=$1; shift
+  "$ADM" "$@" > "$tmp/out" 2>&1
+  [[ -s $tmp/out ]] || echo "(no output)" > "$tmp/out"
+  dlg --title "$title" --exit-label OK --textbox "$tmp/out" 0 0
+}
+
+msg() { dlg --title "$1" --msgbox "$2" 0 0; }
+setting() { "$ADM" config | sed -n "s/^$1=//p"; }
+certs_mode() { ! grep -q '^verify-client-cert none' /etc/openvpn/server/server.conf 2>/dev/null; }
+home_dir() { getent passwd "${SUDO_USER:-root}" | cut -d: -f6; }
+
+# Pick a VPN user; prints the name
+pick_user() {
+  local items=() u
+  while read -r u; do [[ -n $u ]] && items+=("$u" ""); done < <("$ADM" users --names)
+  (( ${#items[@]} )) || { msg "$1" "There are no VPN users yet."; return 1; }
+  dlg --title "$1" --menu "Choose a user:" 0 50 0 "${items[@]}"
+}
+
+# Pick a client certificate; prints the name
+pick_client() {
+  local items=() name state exp left
+  while read -r name state exp left; do
+    [[ $name == CLIENT || $name == No ]] && continue
+    items+=("$name" "$state, expires $exp ($left days)")
+  done < <("$ADM" client list)
+  (( ${#items[@]} )) || { msg "$1" "There are no client certificates yet."; return 1; }
+  dlg --title "$1" --menu "Choose a client:" 0 70 0 "${items[@]}"
+}
+
+# Ask for a password twice, or "" for a random one; prints it
+ask_password() {
+  dlg --title "$1" --yes-label "Random" --no-label "Type one" \
+      --yesno "Generate a random 20-character password, or type your own?" 0 0 && { echo; return 0; }
+  local p1 p2
+  while :; do
+    p1=$(dlg --title "$1" --insecure --passwordbox "Password (8+ characters):" 0 50) || return 1
+    p2=$(dlg --title "$1" --insecure --passwordbox "Same password again:" 0 50) || return 1
+    [[ $p1 == "$p2" ]] && (( ${#p1} >= 8 )) && { echo "$p1"; return 0; }
+    msg "$1" "The passwords did not match or were shorter than 8 characters."
+  done
+}
+
+# Run add/passwd with a typed or random password and show the result
+set_password() {
+  local title=$1 cmd=$2 user=$3 pw
+  pw=$(ask_password "$title") || return
+  if [[ -n $pw ]]; then
+    "$ADM" "$cmd" "$user" --password-stdin <<< "$pw" > "$tmp/out" 2>&1
+  else
+    "$ADM" "$cmd" "$user" > "$tmp/out" 2>&1
+  fi
+  dlg --title "$title" --exit-label OK --textbox "$tmp/out" 0 0
+}
+
+add_user() {
+  local u
+  u=$(dlg --title "Add VPN user" --inputbox "User name (an existing Linux user is just added to the VPN group;\na new one is created without shell access):" 0 70) || return
+  [[ -n $u ]] || return
+  if id "$u" >/dev/null 2>&1; then
+    show "Add VPN user" add "$u"
+  else
+    set_password "Add VPN user" add "$u"
+  fi
+}
+
+remove_user() {
+  local u
+  u=$(pick_user "Remove VPN user") || return
+  if [[ $(getent passwd "$u" | cut -d: -f7) == */nologin ]] &&
+     dlg --title "Remove VPN user" --defaultno --yesno "$u is a VPN-only account.\n\nDelete the account completely as well?" 0 0; then
+    show "Remove VPN user" remove "$u" --purge
+  else
+    dlg --title "Remove VPN user" --yesno "Take $u off the VPN and disconnect them?" 0 0 && show "Remove VPN user" remove "$u"
+  fi
+}
+
+save_profile() {
+  local title=$1 name=$2 default out
+  default="$(home_dir)/${name:-$(setting PROFILE_NAME)}.ovpn"
+  out=$(dlg --title "$title" --inputbox "Save the .ovpn file as:" 0 70 "$default") || return 1
+  echo "$out"
+}
+
+clients_menu() {
+  local c name days out
+  while :; do
+    c=$(dlg --title "Client certificates" --cancel-label Back --menu \
+        "Each person gets their own .ovpn. Its certificate expires after the\nchosen number of days; revoke it to cut them off at once." 0 70 0 \
+        list "Show certificates and expiry" \
+        add "Issue a certificate and .ovpn" \
+        renew "Replace a certificate (new .ovpn)" \
+        revoke "Revoke a certificate") || return
+    case $c in
+      list) show "Client certificates" client list ;;
+      add)
+        name=$(dlg --title "New client" --inputbox "Client name (who will use it, e.g. jane-laptop):" 0 60) || continue
+        [[ -n $name ]] || continue
+        days=$(dlg --title "New client" --inputbox "Valid for how many days?" 0 50 "$(setting CERT_DAYS)") || continue
+        out=$(save_profile "New client" "$name") || continue
+        show "New client" client add "$name" "$days" "$out" ;;
+      renew)
+        name=$(pick_client "Renew certificate") || continue
+        days=$(dlg --title "Renew $name" --inputbox "Valid for how many days?" 0 50 "$(setting CERT_DAYS)") || continue
+        out=$(save_profile "Renew $name" "$name") || continue
+        dlg --title "Renew $name" --yesno "The current .ovpn for $name will stop working. Continue?" 0 0 &&
+          show "Renew $name" client renew "$name" "$days" "$out" ;;
+      revoke)
+        name=$(pick_client "Revoke certificate") || continue
+        dlg --title "Revoke $name" --defaultno --yesno "Revoke $name? Their .ovpn stops working immediately." 0 0 &&
+          show "Revoke $name" client revoke "$name" ;;
+    esac
+  done
+}
+
+whitelist_menu() {
+  local c ip note
+  while :; do
+    c=$(dlg --title "IP whitelist" --cancel-label Back --menu "Only these source addresses can reach the VPN port." 0 60 0 \
+        list "Show allowed addresses" add "Allow an address or network" remove "Remove an address") || return
+    case $c in
+      list) show "IP whitelist" whitelist ;;
+      add)
+        ip=$(dlg --title "Allow address" --inputbox "IP address or network (a.b.c.d or a.b.c.d/nn):" 0 60) || continue
+        [[ -n $ip ]] || continue
+        note=$(dlg --title "Allow address" --inputbox "Comment (who is this?):" 0 60) || continue
+        show "Allow address" whitelist add "$ip" "$note" ;;
+      remove)
+        local items=() e
+        while read -r e _; do [[ $e == *:* ]] && items+=("${e%%:*}" ""); done < <("$ADM" whitelist)
+        (( ${#items[@]} )) || { msg "Remove address" "The whitelist is empty."; continue; }
+        ip=$(dlg --title "Remove address" --menu "Remove which address?" 0 50 0 "${items[@]}") || continue
+        show "Remove address" whitelist remove "$ip" ;;
+    esac
+  done
+}
+
+live_log() {
+  journalctl -u openvpn-server@server -n 50 -f --no-pager > "$tmp/live" 2>&1 &
+  local pid=$!
+  dlg --title "Server log (live) - press Exit to stop" --exit-label Exit --tailbox "$tmp/live" 0 0
+  kill $pid 2>/dev/null
+}
+
+logs_menu() {
+  local c
+  while :; do
+    c=$(dlg --title "Logs" --cancel-label Back --menu "" 0 50 0 \
+        auth "Logins and failed logins" recent "Server log (last 500 lines)" live "Server log (live)") || return
+    case $c in
+      auth) show "Logins" auth-log 200 ;;
+      recent) show "Server log" log 500 ;;
+      live) live_log ;;
+    esac
+  done
+}
+
+settings_menu() {
+  local vals form k i=0 lines=() keys="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
+  for k in $keys; do
+    i=$((i + 1))
+    lines+=("$k" "$i" 1 "$(setting "$k")" "$i" 16 30 60)
+  done
+  form=$(dlg --title "Settings" --ok-label "Save" --form \
+      "Network and login settings (/etc/ovpnadm.conf).\nCLIENT_CERTS: yes = a personal expiring .ovpn per person, no = one shared .ovpn.\nThey take effect when you apply them (Install / apply settings)." \
+      0 0 0 "${lines[@]}") || return
+  i=0
+  while IFS= read -r v; do
+    i=$((i + 1)); k=$(echo $keys | cut -d' ' -f$i)
+    [[ -n $k ]] || continue
+    [[ $v == "$(setting "$k")" ]] && continue
+    "$ADM" config set "$k" "$v" > "$tmp/out" 2>&1 || { dlg --title "Settings" --textbox "$tmp/out" 0 0; return; }
+  done <<< "$form"
+  msg "Settings" "Saved. Use \"Install / apply settings\" to put them into effect."
+}
+
+apply_settings() {
+  local n force=()
+  n=$("$ADM" status 2>/dev/null | sed -n 's/.* - \([0-9]*\) client.*/\1/p')
+  "$ADM" config > "$tmp/cfg"
+  dlg --title "Install / apply settings" --yes-label "Apply" --no-label "Cancel" --yesno \
+      "This (re)writes the server configuration and restarts OpenVPN${n:+, disconnecting $n client(s)}.\n\n$(cat "$tmp/cfg")" 0 0 || return
+  if [[ -f /etc/openvpn/server/server.conf ]]; then
+    local want; want=$(setting CLIENT_CERTS)
+    if { certs_mode && [[ $want == no ]]; } || { ! certs_mode && [[ $want == yes ]]; }; then
+      dlg --title "Change login mode" --defaultno --yesno \
+          "CLIENT_CERTS=$want changes how clients log in. Every .ovpn issued so far will stop working and everyone needs a new one.\n\nReally switch?" 0 0 || return
+      force=(-f)
+    fi
+  fi
+  dialog --backtitle "$TITLE" --title "Installing" --infobox "Working..." 3 30
+  show "Install / apply settings" install "${force[@]}"
+}
+
+rotate_key() {
+  dlg --title "Retire all profiles" --defaultno --yesno \
+      "Create a new tls-crypt key?\n\nEVERY .ovpn file issued so far stops working, and all connected clients are dropped. Use it at the end of an engagement or if a profile may have leaked." 0 0 &&
+    show "Retire all profiles" rotate-key
+}
+
+backup_keys() {
+  local out
+  out=$(dlg --title "Back up keys" --inputbox "Save the server keys to (keep this file safe):" 0 70 "$(home_dir)/ovpnadm-keys-$(date +%F).tgz") || return
+  show "Back up keys" backup "$out"
+}
+
+main_menu() {
+  local c items
+  while :; do
+    if [[ ! -f /etc/openvpn/server/server.conf ]]; then
+      c=$(dlg --title "Not set up" --cancel-label Quit --menu "The VPN server is not set up yet." 0 60 0 \
+          settings "Settings" install "Install / apply settings") || return
+    else
+      items=(status "Connected users" users "VPN users" add "Add a user" remove "Remove a user"
+             passwd "Reset a password" kick "Disconnect a user")
+      if certs_mode; then
+        items+=(clients "Client certificates (personal .ovpn files)")
+      else
+        items+=(profile "Save the shared .ovpn profile")
+      fi
+      command -v allowvpn >/dev/null && items+=(whitelist "IP whitelist")
+      items+=(logs "Logs" settings "Settings" install "Install / apply settings"
+              rotate "Retire all profiles (new key)" backup "Back up keys")
+      c=$(dlg --title "Main menu" --cancel-label Quit --menu "" 0 60 0 "${items[@]}") || return
+    fi
+    local u out
+    case $c in
+      status) show "Connected users" status ;;
+      users) show "VPN users" users ;;
+      add) add_user ;;
+      remove) remove_user ;;
+      passwd) u=$(pick_user "Reset password") && set_password "Reset password for $u" passwd "$u" ;;
+      kick) u=$(pick_user "Disconnect user") && show "Disconnect $u" kick "$u" ;;
+      clients) clients_menu ;;
+      profile) out=$(save_profile "Shared profile") && show "Shared profile" profile "$out" ;;
+      whitelist) whitelist_menu ;;
+      logs) logs_menu ;;
+      settings) settings_menu ;;
+      install) apply_settings ;;
+      rotate) rotate_key ;;
+      backup) backup_keys ;;
+    esac
+  done
+}
+
+main_menu
+exit 0
