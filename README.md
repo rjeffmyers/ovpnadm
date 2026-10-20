@@ -75,9 +75,31 @@ ovpnadm does not change the firewall. You need to:
 - give the LAN a way back to `VPN_POOL`: either a route via this host (which
   is automatic if it is their gateway), or NAT.
 
-If an `allowvpn` command is installed (a source-IP whitelist for the VPN
-port), the menu and `ovpnadm whitelist` use it. Restricting the port to known
-client IPs is strongly recommended.
+Restricting the port to known client IPs is strongly recommended.
+
+## IP whitelist by user
+
+If an `allowvpn` command is installed (it manages a source-IP whitelist for
+the VPN port: `allowvpn <ip> [comment]`, `allowvpn -r <ip>`, `allowvpn -l`),
+ovpnadm records **which users each address belongs to**, so you can remove
+people instead of looking up addresses:
+
+```
+sudo ovpnadm whitelist add 203.0.113.25 -u jane home   # allow it for jane
+sudo ovpnadm whitelist                                 # addresses, users, logins seen, SHARED
+sudo ovpnadm whitelist remove-user jane --dry-run      # what would go
+sudo ovpnadm whitelist remove-user jane
+```
+
+- An address recorded for several users (an office) is flagged **SHARED**, you
+  are warned when adding it for another user, and removing one user keeps it
+  for the others.
+- The list also shows who has actually **logged in from** each address (from
+  the login history), so unrecorded or shared use shows up too.
+- `ovpnadm remove <user>` cleans up that user's addresses automatically - handy
+  for an offboarding checklist.
+
+The records live in `/var/lib/ovpnadm/whitelist-users`.
 
 ## Switching an existing server to personal profiles
 
@@ -98,6 +120,7 @@ sudo ovpnadm client add <name>       # one per person
 | `/etc/openvpn/server/easy-rsa/` | CA and certificates |
 | `/etc/pam.d/openvpn` | login check (password + group) |
 | `/run/openvpn-server/mgmt.sock` | management socket (root only) |
+| `/var/lib/ovpnadm/whitelist-users` | which users each whitelist address is for |
 
 ## License
 

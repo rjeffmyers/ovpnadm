@@ -82,11 +82,14 @@ add_user() {
 remove_user() {
   local u
   u=$(pick_user "Remove VPN user") || return
+  local wl=""
+  command -v allowvpn >/dev/null && wl="\n\nWhitelist:\n$("$ADM" whitelist remove-user "$u" --dry-run 2>&1 | sed '$d')"
+  dlg --title "Remove VPN user" --yesno "Take $u off the VPN and disconnect them?$wl" 0 0 || return
   if [[ $(getent passwd "$u" | cut -d: -f7) == */nologin ]] &&
      dlg --title "Remove VPN user" --defaultno --yesno "$u is a VPN-only account.\n\nDelete the account completely as well?" 0 0; then
     show "Remove VPN user" remove "$u" --purge
   else
-    dlg --title "Remove VPN user" --yesno "Take $u off the VPN and disconnect them?" 0 0 && show "Remove VPN user" remove "$u"
+    show "Remove VPN user" remove "$u"
   fi
 }
 
@@ -129,22 +132,45 @@ clients_menu() {
 }
 
 whitelist_menu() {
-  local c ip note
+  local c ip note user items e users
   while :; do
-    c=$(dlg --title "IP whitelist" --cancel-label Back --menu "Only these source addresses can reach the VPN port." 0 60 0 \
-        list "Show allowed addresses" add "Allow an address or network" remove "Remove an address") || return
+    c=$(dlg --title "IP whitelist" --cancel-label Back --menu "Only these source addresses can reach the VPN port." 0 66 0 \
+        list "Show addresses, their users and who logged in from them" \
+        add "Allow an address for a user" \
+        remove-user "Remove a user's addresses" \
+        remove "Remove an address") || return
     case $c in
       list) show "IP whitelist" whitelist ;;
       add)
         ip=$(dlg --title "Allow address" --inputbox "IP address or network (a.b.c.d or a.b.c.d/nn):" 0 60) || continue
         [[ -n $ip ]] || continue
-        note=$(dlg --title "Allow address" --inputbox "Comment (who is this?):" 0 60) || continue
-        show "Allow address" whitelist add "$ip" "$note" ;;
+        items=(- "(not for a specific user)")
+        while read -r e; do [[ -n $e ]] && items+=("$e" ""); done < <("$ADM" users --names)
+        user=$(dlg --title "Allow $ip" --menu "Whose address is it?" 0 50 0 "${items[@]}") || continue
+        note=$(dlg --title "Allow $ip" --inputbox "Comment (optional, e.g. home, office):" 0 60) || continue
+        if [[ $user == - ]]; then
+          show "Allow address" whitelist add "$ip" "$note"
+        else
+          show "Allow address" whitelist add "$ip" -u "$user" "$note"
+        fi ;;
+      remove-user)
+        user=$(pick_user "Remove a user's addresses") || continue
+        "$ADM" whitelist remove-user "$user" --dry-run > "$tmp/out" 2>&1
+        dlg --title "Remove addresses of $user" --yes-label "Remove" --no-label "Cancel" --yesno \
+            "This is what will happen:\n\n$(sed '$d' "$tmp/out")" 0 0 &&
+          show "Remove addresses of $user" whitelist remove-user "$user" ;;
       remove)
-        local items=() e
-        while read -r e _; do [[ $e == *:* ]] && items+=("${e%%:*}" ""); done < <("$ADM" whitelist)
+        items=()
+        while IFS= read -r e; do
+          read -r ip users _ <<< "$e"
+          [[ $ip =~ ^[0-9] ]] && items+=("$ip" "$( [[ $users == - ]] && echo "" || echo "$users")")
+        done < <("$ADM" whitelist)
         (( ${#items[@]} )) || { msg "Remove address" "The whitelist is empty."; continue; }
-        ip=$(dlg --title "Remove address" --menu "Remove which address?" 0 50 0 "${items[@]}") || continue
+        ip=$(dlg --title "Remove address" --menu "Remove which address? (users recorded for it are shown)" 0 66 0 "${items[@]}") || continue
+        users=$("$ADM" whitelist | awk -v ip="$ip" '$1 == ip {print $2}')
+        if [[ -n $users && $users != - ]]; then
+          dlg --title "Remove $ip" --defaultno --yesno "$ip is recorded for: $users\n\nThey will no longer be able to connect from it. Remove it?" 0 0 || continue
+        fi
         show "Remove address" whitelist remove "$ip" ;;
     esac
   done

@@ -7,7 +7,8 @@
 #   status                          connected clients
 #   users [--names]                 VPN users (members of the VPN group)
 #   add <user> [--password-stdin]   add a VPN user; new accounts get a random password
-#   remove <user> [--purge]         take a user off the VPN; --purge deletes a VPN-only account
+#   remove <user> [--purge]         take a user off the VPN (and their whitelist addresses);
+#                                   --purge also deletes a VPN-only account
 #   passwd <user> [--password-stdin] set a new password (random unless given on stdin)
 #   kick <user>                     disconnect a user's sessions now
 #   client list                     client certificates and their expiry  (CLIENT_CERTS=yes)
@@ -18,7 +19,10 @@
 #   rotate-key                      new tls-crypt key: every issued .ovpn stops working
 #   log [lines] [-f]                server log
 #   auth-log [lines]                logins and failed logins
-#   whitelist [add <ip> [comment] | remove <ip>]   source IP whitelist (needs allowvpn)
+#   whitelist                       source IP whitelist, with users per address  (needs allowvpn)
+#   whitelist add <ip> [-u user] [comment]   allow an address (for a user)
+#   whitelist remove <ip>           remove an address
+#   whitelist remove-user <user> [--dry-run] remove a user's addresses (shared ones are kept)
 #   backup <file>                   save the keys, so a rebuilt server accepts existing profiles
 #   config [set <KEY> <value>]      show or change settings
 #
@@ -36,6 +40,7 @@ SERVER_CONF=$D/server.conf
 UNIT=openvpn-server@server
 STATUS=${OVPNADM_STATUS:-/var/log/openvpn/status.log}
 MGMT=${OVPNADM_MGMT:-/run/openvpn-server/mgmt.sock}
+WL_MAP=${OVPNADM_WLMAP:-/var/lib/ovpnadm/whitelist-users}   # whitelist entry -> user records
 KEYS="ca.crt server.crt server.key tc.key crl.pem easy-rsa"
 CONF_KEYS="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
 
@@ -365,14 +370,15 @@ cmd_users() {
   last=$(journalctl -u $UNIT --no-pager -q -o short-iso -g 'authentication succeeded for username' 2>/dev/null |
          sed -n "s/^\([^ ]*\) .*for username '\([^']*\)'.*/\2 \1/p" | awk '{t[$1] = $2} END {for (u in t) print u, t[u]}')
   {
-    echo "USER STATE SESSIONS LAST-LOGIN"
+    echo "USER STATE SESSIONS LAST-LOGIN WHITELIST"
     while read -r u; do
       case $(passwd -S "$u" 2>/dev/null | awk '{print $2}') in
         P) state=active ;; L) state=locked ;; NP) state=no-password ;; *) state=no-account ;;
       esac
-      printf '%s %s %s %s\n' "$u" "$state" \
+      printf '%s %s %s %s %s\n' "$u" "$state" \
         "$(grep -m1 "^$u:" <<< "$online" | cut -d: -f2 | grep . || echo 0)" \
-        "$(awk -v u="$u" '$1 == u {print substr($2, 1, 16)}' <<< "$last" | grep . || echo never)"
+        "$(awk -v u="$u" '$1 == u {print substr($2, 1, 16)}' <<< "$last" | grep . || echo never)" \
+        "$(map_nets "$u" | paste -sd, | grep . || echo -)"
     done <<< "$names"
   } | column -t
 }
@@ -409,6 +415,7 @@ cmd_remove() {
     echo "removed $u from the VPN"
   fi
   drop_sessions user "$u" && echo "disconnected $u's sessions"
+  command -v allowvpn >/dev/null && wl_remove_user "$u" ""
   if [[ ${2:-} == --purge ]]; then
     local shell uid
     shell=$(getent passwd "$u" | cut -d: -f7); uid=$(id -u "$u")
@@ -553,6 +560,11 @@ cmd_auth_log() {
   local n=${1:-50}
   [[ $n =~ ^[0-9]+$ ]] || usage
   echo "TIME                 RESULT  USER                 CLIENT               FROM"
+  auth_events | tail -n "$n"
+}
+
+# One line per login event: time result user client from
+auth_events() {
   journalctl -u $UNIT --no-pager -q -o short-iso \
     -g 'authentication succeeded for username|failed to authenticate|Username/Password verification failed|VERIFY ERROR' 2>/dev/null |
   awk '
@@ -569,20 +581,164 @@ cmd_auth_log() {
     / failed to authenticate/ { match($0, /user .[^\047]*\047/); fu = substr($0, RSTART + 6, RLENGTH - 7); next }
     /authentication succeeded/ { match($0, /username .[^\047]*\047/); peer($0); out($1, "OK", substr($0, RSTART + 10, RLENGTH - 11)); next }
     /verification failed/ { peer($0); out($1, "FAILED", fu == "" ? "?" : fu); fu = ""; next }
-    /VERIFY ERROR/ { peer($0); r = $0; sub(/.*error=/, "", r); CLIENT = "cert: " r; out($1, "REFUSED", "-") }
-  ' | tail -n "$n"
+    /VERIFY ERROR/ { peer($0); r = $0; sub(/.*error=/, "", r); sub(/:.*/, "", r); gsub(/ /, "-", r); CLIENT = r; out($1, "REFUSED", "-") }
+  '
 }
 
 # --- whitelist and backup ---------------------------------------------------
 
+# The firewall side is done by "allowvpn" (ip | -r ip | -l). ovpnadm keeps its
+# own record of which users each whitelist entry belongs to, so entries can be
+# removed by user and addresses shared by several users are flagged.
+
+# a.b.c.d[/nn] -> network with host bits cleared, /32 dropped (as allowvpn stores it)
+norm_net() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})(/([0-9]{1,2}))?$ ]] || return 1
+  local i v=0 b=${BASH_REMATCH[6]:-32}
+  for i in 1 2 3 4; do (( 10#${BASH_REMATCH[i]} <= 255 )) || return 1; (( v = v * 256 + 10#${BASH_REMATCH[i]} )); done
+  (( 10#$b >= 8 && 10#$b <= 32 )) || return 1
+  (( b = 10#$b, v &= (0xffffffff << (32 - b)) & 0xffffffff ))
+  printf '%d.%d.%d.%d' $(( v >> 24 )) $(( v >> 16 & 255 )) $(( v >> 8 & 255 )) $(( v & 255 ))
+  (( b == 32 )) || printf '/%d' "$b"
+  echo
+}
+
+# Does address $1 fall inside network $2?
+ip_in() {
+  local a n b
+  a=$(norm_net "$1") || return 1
+  b=${2#*/}; [[ $2 == */* ]] || b=32
+  n=$(norm_net "${a%/*}/$b") || return 1
+  [[ ${n%/32} == "$(norm_net "$2")" ]]
+}
+
+need_whitelist() { command -v allowvpn >/dev/null || die "no whitelist tool: this needs 'allowvpn' (see README)"; }
+
+# Firewall entries: "source<TAB>comment"
+wl_entries() {
+  allowvpn -l 2>/dev/null | awk '/^[0-9]/ { split($1, a, ":"); c = $0; if (!sub(/^[^#]*#[ \t]*/, "", c)) c = ""; print a[1] "\t" c }'
+}
+
+# The entry that contains address $1 (exact entry first)
+wl_entry_for() {
+  local src
+  while IFS=$'\t' read -r src _; do [[ $src == "$1" ]] && { echo "$src"; return; }; done < <(wl_entries)
+  while IFS=$'\t' read -r src _; do ip_in "${1%/*}" "$src" && { echo "$src"; return; }; done < <(wl_entries)
+  return 1
+}
+
+map_users() { [[ -f $WL_MAP ]] && awk -v n="$1" '$1 == n {print $2}' "$WL_MAP" | sort -u; }
+map_nets() { [[ -f $WL_MAP ]] && awk -v u="$1" '$2 == u {print $1}' "$WL_MAP" | sort -u; }
+map_add() {
+  mkdir -p "${WL_MAP%/*}"
+  [[ -n $(map_users "$1" | grep -x "$2") ]] || echo "$1 $2 $(date +%F)" >> "$WL_MAP"
+}
+# Remove mappings for network $1 (only for user $2 if given)
+map_del() {
+  [[ -f $WL_MAP ]] || return 0
+  awk -v n="$1" -v u="${2:-}" '!($1 == n && (u == "" || $2 == u))' "$WL_MAP" > "$WL_MAP.tmp" && mv "$WL_MAP.tmp" "$WL_MAP"
+}
+
+# "user ip" for every successful login in the journal
+seen_logins() { auth_events | awk '$2 == "OK" && $5 != "" {print $3, $5}' | sort -u; }
+
+# Users seen logging in from inside network $1, from "user ip" lines on stdin
+seen_in() {
+  local u ip
+  while read -r u ip; do ip_in "$ip" "$1" && echo "$u"; done | sort -u
+}
+
 cmd_whitelist() {
-  command -v allowvpn >/dev/null || die "no whitelist tool: this needs 'allowvpn' (see README)"
-  case ${1:-} in
-    "")     allowvpn -l ;;
-    add)    [[ -n ${2:-} ]] || usage; allowvpn "$2" "${@:3}" ;;
-    remove) [[ -n ${2:-} ]] || usage; allowvpn -r "$2" ;;
-    *)      usage ;;
+  need_whitelist
+  local sub=${1:-list}; shift || true
+  case $sub in
+    list)
+      local seen src comment users saw all flag
+      seen=$(seen_logins)
+      {
+        printf 'ADDRESS\tUSERS\tLOGINS-SEEN-FROM\tNOTE\tCOMMENT\n'
+        while IFS=$'\t' read -r src comment; do
+          users=$(map_users "$src" | paste -sd,)
+          saw=$(seen_in "$src" <<< "$seen" | paste -sd,)
+          all=$(printf '%s\n%s\n' "${users//,/$'\n'}" "${saw//,/$'\n'}" | grep . | sort -u | wc -l)
+          flag=""; (( all > 1 )) && flag="SHARED"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$src" "${users:--}" "${saw:--}" "${flag:--}" "${comment:--}"
+        done < <(wl_entries)
+      } | column -t -s $'\t'
+      ;;
+    add)
+      local ip=${1:-} user="" net entry others
+      [[ -n $ip ]] || usage; shift
+      [[ ${1:-} == -u ]] && { user=${2:-}; [[ -n $user ]] || usage; valid_user "$user"; shift 2; }
+      net=$(norm_net "$ip") || die "invalid address: $ip"
+      if [[ -n $user ]] && ! group_members | grep -qx "$user"; then
+        echo "note: $user is not a VPN user (yet)"
+      fi
+      allowvpn "$net" "${user:+$user: }$*" || exit 1
+      entry=$(wl_entry_for "$net") || die "$net did not show up in the whitelist"
+      [[ $entry != "$net" ]] && echo "$net is covered by the existing entry $entry"
+      if [[ -n $user ]]; then
+        others=$(map_users "$entry" | grep -vx "$user" | paste -sd, || true)
+        map_add "$entry" "$user"
+        echo "recorded $entry for $user"
+        [[ -n $others ]] && echo "WARNING: $entry is also used by: $others"
+      fi
+      return 0
+      ;;
+    remove)
+      local ip=${1:-} net users
+      [[ -n $ip ]] || usage
+      net=$(norm_net "$ip") || die "invalid address: $ip"
+      users=$(map_users "$net" | paste -sd,)
+      allowvpn -r "$net" || exit 1
+      map_del "$net"
+      [[ -n $users ]] && echo "$net was recorded for: $users"
+      return 0
+      ;;
+    remove-user)
+      local user=${1:-} dry=""
+      [[ -n $user ]] || usage
+      valid_user "$user"
+      [[ ${2:-} == --dry-run ]] && dry=1
+      wl_remove_user "$user" "$dry"
+      ;;
+    *) usage ;;
   esac
+}
+
+# Remove the whitelist entries recorded for a user, keeping ones other users
+# still have; also point out entries the user logged in from that are not
+# recorded for them. $2 non-empty: only report.
+wl_remove_user() {
+  local user=$1 dry=$2 net others seen saw n=0
+  while read -r net; do
+    [[ -n $net ]] || continue
+    n=$((n + 1))
+    others=$(map_users "$net" | grep -vx "$user" | paste -sd, || true)
+    if [[ $(wl_entry_for "$net" || true) != "$net" ]]; then
+      echo "$net: no longer in the whitelist, dropping the record"
+      [[ -n $dry ]] || map_del "$net" "$user"
+    elif [[ -n $others ]]; then
+      echo "$net: KEPT - also used by $others"
+      [[ -n $dry ]] || map_del "$net" "$user"
+    else
+      echo "$net: removed from the whitelist"
+      [[ -n $dry ]] || { allowvpn -r "$net" >/dev/null && map_del "$net"; } || echo "  (failed to remove $net)"
+    fi
+  done < <(map_nets "$user")
+  (( n > 0 )) || echo "no whitelist entries are recorded for $user"
+  # Entries the user has logged in from, but recorded for nobody or for others
+  seen=$(seen_logins | awk -v u="$user" '$1 == u')
+  local src
+  while IFS=$'\t' read -r src _; do
+    map_users "$src" | grep -qx "$user" && continue
+    saw=$(seen_in "$src" <<< "$seen")
+    [[ -n $saw ]] || continue
+    others=$(map_users "$src" | paste -sd,)
+    echo "note: $user has logged in from $src, which is not recorded for them${others:+ (recorded for: $others)} - left in place"
+  done < <(wl_entries)
+  [[ -n $dry ]] && echo "(dry run - nothing changed)"
+  return 0
 }
 
 cmd_backup() {
