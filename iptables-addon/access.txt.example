@@ -1,0 +1,10 @@
+# VPN user access - one line per user (read by /etc/firewall/rc.openvpn):
+#   <vpn user>  <n>  <host>[,<host>...]  <port/proto>[,...] | all
+# The user always gets VPN address 172.30.98.<n> (UDP) / 172.30.99.<n> (TCP),
+# a route to each host, and may reach only those hosts on those ports (plus
+# ping). A host may be a network: 192.168.1.0/24 all = the whole LAN.
+# n: 10-250, unique. A user not listed here cannot connect at all.
+# Apply: sudo /etc/firewall/rc.openvpn   (takes effect at the next connection)
+# Easier: sudo vpnuser add|set|del ...  (edits this file and applies it)
+jane.doe             10  192.168.1.106   3389/tcp,3389/udp
+john.roe             11  192.168.1.0/24  all

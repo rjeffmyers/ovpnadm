@@ -1,0 +1,162 @@
+#!/bin/bash
+#
+# /etc/firewall/rc.openvpn - OpenVPN rules that rc.firewall does not know about.
+#
+# rc.firewall flushes every table when it runs, so rc.start and fix call this
+# afterwards to put these back. Safe to run any number of times.
+#
+#   - UDP 443 and TCP 993 from the internet are forwarded to OpenVPN on 1194.
+#     Who may connect is the whitelist allow_openvpn.txt (ip:1194/udp and
+#     ip:1194/tcp), read by rc.firewall like the other allow files.
+#   - Each VPN user gets a fixed VPN address and may reach only their own
+#     hosts (or networks) and ports, listed in /etc/openvpn/server/access.txt.
+#     Anything else
+#     from the tunnel is dropped, including connections to this box.
+#   - VPN traffic to the LAN leaves with this box's LAN address, so the hosts
+#     answer without any route changes.
+#   - Every user gets DNS_SERVER as DNS server for DNS_DOMAIN names and may
+#     reach it on port 53. Internet traffic is not sent through the VPN.
+#   - Writes the per-user OpenVPN files (ccd-udp/, ccd-tcp/) from access.txt.
+#     A user without one cannot connect (ccd-exclusive in the server configs).
+#
+# After editing access.txt: sudo /etc/firewall/rc.openvpn
+# (takes effect at the user's next connection)
+#
+# Site settings go in /etc/firewall/rc.openvpn.conf (same variable names).
+
+EXT_IF=eth0                # internet side
+INT_IF=eth1                # LAN side
+VPN_PORT=1194
+VPN_REDIRECT="443/udp 993/tcp"   # extra ports forwarded to VPN_PORT; empty = none
+UDP_NET=172.30.98          # .0/24, openvpn-server@server (server.conf)
+TCP_NET=172.30.99          # .0/24, openvpn-server@tcp (tcp.conf)
+DNS_SERVER=""              # pushed to every user; empty = push no DNS
+DNS_DOMAIN=""
+CONF=${RC_OPENVPN_CONF:-/etc/firewall/rc.openvpn.conf}
+# shellcheck source=/dev/null
+[[ -r $CONF ]] && . "$CONF"
+DIR=${OVPN_DIR:-/etc/openvpn/server}
+ACCESS=$DIR/access.txt
+IPT=${IPT:-/usr/sbin/iptables}
+TAG="# written by /etc/firewall/rc.openvpn from access.txt - edit access.txt instead"
+
+warn() { echo "rc.openvpn: $*" >&2; }
+valid_ip() {
+  [[ $1 =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local i; for i in 1 2 3 4; do (( BASH_REMATCH[i] <= 255 )) || return 1; done
+}
+# A host (a.b.c.d) or a network (a.b.c.d/nn, nn 8-32, no host bits set)
+valid_host() {
+  [[ $1 == */* ]] || { valid_ip "$1"; return; }
+  valid_ip "${1%/*}" && [[ ${1#*/} =~ ^[0-9]{1,2}$ ]] && (( ${1#*/} >= 8 && ${1#*/} <= 32 )) || return 1
+  [[ $(route_of "$1") == "${1%/*} "* ]]
+}
+# "a.b.c.d/nn" or "a.b.c.d" -> "<network> <netmask>" for an OpenVPN route
+route_of() {
+  local ip=${1%/*} bits=32 a b c d n m
+  [[ $1 == */* ]] && bits=${1#*/}
+  IFS=. read -r a b c d <<< "$ip"
+  m=$(( bits ? (0xffffffff << (32 - bits)) & 0xffffffff : 0 ))
+  n=$(( ((a << 24) | (b << 16) | (c << 8) | d) & m ))
+  echo "$((n >> 24 & 255)).$((n >> 16 & 255)).$((n >> 8 & 255)).$((n & 255))" \
+       "$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
+}
+
+# Own chains, emptied and refilled; one jump each from the built-in chains
+for c in "nat OVPN_PRE" "nat OVPN_POST" "filter OVPN_FWD" "filter OVPN_IN"; do
+  set -- $c
+  $IPT -t "$1" -N "$2" 2>/dev/null
+  $IPT -t "$1" -F "$2"
+done
+$IPT -t nat -C PREROUTING -i $EXT_IF -j OVPN_PRE >/dev/null 2>&1 || $IPT -t nat -I PREROUTING 1 -i $EXT_IF -j OVPN_PRE
+$IPT -t nat -C POSTROUTING -o $INT_IF -j OVPN_POST >/dev/null 2>&1 || $IPT -t nat -I POSTROUTING 1 -o $INT_IF -j OVPN_POST
+$IPT -C FORWARD -i tun+ -j OVPN_FWD >/dev/null 2>&1 || $IPT -I FORWARD 1 -i tun+ -j OVPN_FWD
+$IPT -C INPUT -i tun+ -j OVPN_IN >/dev/null 2>&1 || $IPT -I INPUT 1 -i tun+ -j OVPN_IN
+
+# Log each new connection attempt on the VPN ports (whitelisted or not), so
+# "showvpn -a" can show who tried; at most 30 a minute
+for r in $VPN_PORT/udp $VPN_PORT/tcp $VPN_REDIRECT; do
+  f=""; [[ ${r#*/} == tcp ]] && f="--syn"
+  $IPT -t nat -A OVPN_PRE -p "${r#*/}" $f --dport "${r%/*}" -m limit --limit 30/min --limit-burst 10 \
+    -j LOG --log-prefix "OVPN-TRY " --log-level info
+done
+for r in $VPN_REDIRECT; do
+  $IPT -t nat -A OVPN_PRE -p "${r#*/}" --dport "${r%/*}" -j REDIRECT --to-ports $VPN_PORT
+done
+$IPT -t nat -A OVPN_POST -s $UDP_NET.0/24 -j MASQUERADE
+$IPT -t nat -A OVPN_POST -s $TCP_NET.0/24 -j MASQUERADE
+
+# VPN clients may not open connections to this box
+$IPT -A OVPN_IN -m state --state RELATED,ESTABLISHED -j ACCEPT
+$IPT -A OVPN_IN -j DROP
+
+$IPT -A OVPN_FWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+if [[ -n $DNS_SERVER ]]; then
+  for p in udp tcp; do $IPT -A OVPN_FWD -d $DNS_SERVER -p $p --dport 53 -j ACCEPT; done
+fi
+
+# access.txt: <user> <n> <host>[,<host>...] <port/proto>[,...]|all
+# A host may be a network, e.g. 192.168.1.0/24 all = the whole LAN
+mkdir -p "$DIR/ccd-udp" "$DIR/ccd-tcp"
+chmod 755 "$DIR/ccd-udp" "$DIR/ccd-tcp"
+declare -A seen_user seen_n
+users=""
+if [[ -f $ACCESS ]]; then
+  while read -r user n hosts ports _; do
+    [[ -z $user || $user == \#* ]] && continue
+    line="$user $n $hosts $ports"
+    if [[ ! $user =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then warn "bad user name, skipped: $line"; continue; fi
+    if [[ ! $n =~ ^[0-9]+$ ]] || (( n < 10 || n > 250 )); then warn "n must be 10-250, skipped: $line"; continue; fi
+    if [[ -n ${seen_user[$user]} || -n ${seen_n[$n]} ]]; then warn "duplicate user or n, skipped: $line"; continue; fi
+    ok=1
+    for h in ${hosts//,/ }; do valid_host "$h" || ok=""; done
+    [[ -n $hosts && -n $ok ]] || { warn "bad host list, skipped: $line"; continue; }
+    if [[ $ports != all ]]; then
+      for p in ${ports//,/ }; do [[ $p =~ ^[0-9]{1,5}(-[0-9]{1,5})?/(tcp|udp)$ ]] || ok=""; done
+      [[ -n $ports && -n $ok ]] || { warn "bad port list, skipped: $line"; continue; }
+    fi
+    seen_user[$user]=1; seen_n[$n]=1; users="$users $user"
+
+    for net in $UDP_NET $TCP_NET; do
+      src=$net.$n
+      for h in ${hosts//,/ }; do
+        $IPT -A OVPN_FWD -s "$src" -d "$h" -p icmp --icmp-type echo-request -j ACCEPT
+        if [[ $ports == all ]]; then
+          $IPT -A OVPN_FWD -s "$src" -d "$h" -j ACCEPT
+        else
+          for p in ${ports//,/ }; do
+            $IPT -A OVPN_FWD -s "$src" -d "$h" -p "${p#*/}" --dport "${p%/*}" -j ACCEPT
+          done
+        fi
+      done
+    done
+
+    for kind in udp tcp; do
+      net=$UDP_NET; [[ $kind == tcp ]] && net=$TCP_NET
+      {
+        echo "$TAG"
+        echo "ifconfig-push $net.$n 255.255.255.0"
+        for h in ${hosts//,/ }; do echo "push \"route $(route_of "$h")\""; done
+        if [[ -n $DNS_SERVER ]]; then
+          [[ " ${hosts//,/ } " == *" $DNS_SERVER "* ]] || echo "push \"route $DNS_SERVER 255.255.255.255\""
+          echo "push \"dhcp-option DNS $DNS_SERVER\""
+          [[ -n $DNS_DOMAIN ]] && echo "push \"dhcp-option DOMAIN $DNS_DOMAIN\""
+        fi
+      } > "$DIR/ccd-$kind/$user.tmp"
+      chmod 644 "$DIR/ccd-$kind/$user.tmp"
+      mv "$DIR/ccd-$kind/$user.tmp" "$DIR/ccd-$kind/$user"
+    done
+  done < "$ACCESS"
+else
+  warn "$ACCESS not found - no VPN user can reach anything"
+fi
+
+$IPT -A OVPN_FWD -j DROP
+
+# Remove per-user files we wrote for users no longer in access.txt
+for f in "$DIR"/ccd-udp/* "$DIR"/ccd-tcp/*; do
+  [[ -f $f ]] || continue
+  [[ " $users " == *" ${f##*/} "* ]] && continue
+  head -1 "$f" | grep -qxF "$TAG" && rm -f "$f"
+done
+exit 0

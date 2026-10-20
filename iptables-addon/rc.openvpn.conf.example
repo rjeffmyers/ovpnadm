@@ -1,0 +1,12 @@
+# /etc/firewall/rc.openvpn.conf - site settings for rc.openvpn and vpnuser.
+# Anything left out keeps the default shown in rc.openvpn.
+
+EXT_IF=eth0                # internet side
+INT_IF=eth1                # LAN side
+LAN=192.168.1.0/24         # what "vpnuser add <user> lan" gives
+VPN_PORT=1194
+VPN_REDIRECT="443/udp 993/tcp"   # extra ports forwarded to VPN_PORT; empty = none
+UDP_NET=172.30.98          # .0/24, must match "server" in server.conf
+TCP_NET=172.30.99          # .0/24, must match "server" in tcp.conf
+DNS_SERVER=192.168.1.10    # pushed to every user, reachable on port 53; empty = none
+DNS_DOMAIN=example.com     # names looked up through DNS_SERVER

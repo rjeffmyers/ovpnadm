@@ -53,6 +53,22 @@ sudo ovpnadm backup keys.tgz         # restore with: ovpnadm install -r keys.tgz
 
 Run `ovpnadm help` for everything.
 
+## Who is connected: showvpn
+
+```
+showvpn                  # connected users, the port each one dialled, traffic
+showvpn -w               # same, refreshed every 5 seconds
+showvpn -a               # today's connection attempts per address (whitelisted or not)
+showvpn -a "2 hours ago"
+showvpn -f               # watch attempts live, e.g. while someone tries to connect
+```
+
+It reads every `/var/log/openvpn/status*.log` (a file with `tcp` in its name
+is shown as TCP), so it works for ovpnadm servers and for a UDP+TCP pair.
+The PORT column comes from connection tracking (package `conntrack`) and shows
+the port a client really dialled when other ports are forwarded to the VPN
+port. `-a` and `-f` need the attempt log rules that the iptables add-on writes.
+
 ## Expiry and rotation
 
 Every personal profile has two rules, set when it is issued and changed with
@@ -150,6 +166,54 @@ sudo ovpnadm whitelist remove-user jane
 
 The records live in `/var/lib/ovpnadm/whitelist-users`.
 
+## Per-user access for iptables firewalls (iptables-addon)
+
+`iptables-addon/` is for a host whose firewall is a classic iptables script
+that flushes everything when it runs. It gives each VPN user a fixed VPN
+address and lets them reach **only their own hosts and ports**, the whole LAN
+for some, a single RDP desktop for others. Everything else from the tunnel,
+including this host, is dropped. It runs a UDP server and a TCP twin
+(`openvpn-server@server` and `@tcp`, pools `UDP_NET` / `TCP_NET`), can forward
+extra ports (UDP 443, TCP 993) to the VPN port for networks that block 1194, and
+pushes a DNS server for one domain without sending internet traffic through
+the VPN. The package installs these files in `/usr/share/ovpnadm/iptables-addon/`.
+
+| File | Install as | |
+|---|---|---|
+| `rc.openvpn` | `/etc/firewall/rc.openvpn` (700) | firewall chains `OVPN_*` and the per-user `ccd-udp/`, `ccd-tcp/` files |
+| `rc.openvpn.conf.example` | `/etc/firewall/rc.openvpn.conf` | interfaces, LAN, VPN pools, redirected ports, DNS |
+| `access.txt.example` | `/etc/openvpn/server/access.txt` (600) | who may reach what |
+| `vpnuser` | `/usr/local/sbin/vpnuser` (700) | manage the accounts and `access.txt` |
+
+Then:
+
+- add `client-config-dir ccd-udp` (`ccd-tcp` in `tcp.conf`) and `ccd-exclusive`
+  to the server configs, and remove any `push "route ..."` lines; users without
+  a line in `access.txt` can then not connect at all;
+- run `/etc/firewall/rc.openvpn` at the end of your firewall script, since that
+  script removes the `OVPN_*` chains every time it runs.
+
+```
+sudo vpnuser add jane.doe lan                              # whole LAN, all ports
+sudo vpnuser add john.roe 192.168.1.120 3389/tcp,3389/udp  # RDP to one desktop
+sudo vpnuser set john.roe 192.168.1.121 3389/tcp           # change access
+sudo vpnuser passwd jane.doe                               # new random password
+sudo vpnuser del john.roe                                  # blocked at once
+sudo vpnuser list
+```
+
+`vpnuser` makes VPN-only accounts (no shell) in `vpnusers`. Add
+`DenyGroups vpnusers` to the sshd config so they cannot use SSH or SFTP from
+the LAN either. New passwords are shown and kept in `/root/vpn-passwords.txt`.
+A change that `rc.openvpn` rejects is undone. Changes apply at the user's
+next connection, except removed access, which is blocked at once.
+
+Clients: OpenVPN Connect on Windows needs `setenv CLIENT_CERT 0` in a profile
+without a client certificate (ovpnadm adds it). NetworkManager on Linux sends
+all traffic into the tunnel unless the connection is set to *Use only for
+resources on this connection* (`ipv4.never-default yes`), and that traffic is
+then dropped.
+
 ## Switching an existing server to personal profiles
 
 ```sh
@@ -173,6 +237,8 @@ sudo ovpnadm client add <name>       # one per person
 | `/var/lib/ovpnadm/clients` | each client's renewal period and access-until date |
 | `/usr/lib/ovpnadm/portal` | the self-service web page (service `ovpnadm-portal`) |
 | `/etc/sudoers.d/ovpnadm-portal` | lets the portal run `ovpnadm self` only |
+| `/usr/sbin/showvpn` | who is connected and connection attempts |
+| `/usr/share/ovpnadm/iptables-addon/` | per-user access add-on (see above) |
 
 ## License
 

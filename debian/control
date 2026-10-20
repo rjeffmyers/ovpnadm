@@ -3,6 +3,7 @@ Version: @VERSION@
 Architecture: all
 Maintainer: rjeffmyers <rjeffmyers@users.noreply.github.com>
 Depends: bash (>= 5), openvpn (>= 2.5), easy-rsa (>= 3), dialog, netcat-openbsd, python3 (>= 3.9), sudo, openssl, iproute2, passwd, bsdextrautils | util-linux (<< 2.36)
+Recommends: conntrack
 Section: admin
 Priority: optional
 Description: OpenVPN server setup and user management with local Linux accounts
@@ -14,3 +15,6 @@ Description: OpenVPN server setup and user management with local Linux accounts
  certificates, connected sessions, logs and the client .ovpn profiles, and
  an optional self-service web page, reachable only through the VPN, where
  users renew their profile and change their password.
+ .
+ showvpn lists connected users and connection attempts. An add-on for
+ iptables firewalls gives each user access to only their own hosts and ports.

@@ -1,0 +1,115 @@
+#!/bin/bash
+#
+# showvpn - who is connected to OpenVPN right now
+#
+#   showvpn        connected users (UDP and TCP servers), with the port each
+#                  one dialled (1194, or 443/udp and 993/tcp redirected to it)
+#   showvpn -w     same, refreshed every 5 seconds (Ctrl-C to stop)
+#   showvpn -a [since]  connection attempts per address (default: today),
+#                  e.g. showvpn -a "2 hours ago"; NOT ALLOWED = not whitelisted
+#   showvpn -f     watch attempts live as they arrive (Ctrl-C to stop)
+#                  (-a and -f need the OVPN-TRY log rules from rc.openvpn)
+#
+# Reads the status files the servers rewrite every 30 seconds, so a user who
+# just connected or disconnected can take up to 30 seconds to show.
+
+STATUS_FILES=${STATUS_FILES:-$(echo /var/log/openvpn/status*.log)}
+ACCESS=${ACCESS:-/etc/openvpn/server/access.txt}
+WHITELIST=${WHITELIST:-/etc/firewall/allow_openvpn.txt}
+
+if [[ $EUID -ne 0 ]]; then exec sudo "$0" "$@"; fi
+
+show() {
+  local now f via ct
+  now=$(date +%s)
+  # Connection tracking keeps the port a client dialled before the redirect
+  ct=$(conntrack -L 2>/dev/null)
+  printf '%-22s %-8s %-16s %-14s %-17s %-9s %9s %9s  %s\n' \
+    USER PORT FROM VPN-IP "CONNECTED SINCE" FOR "IN" "OUT" "MAY REACH"
+  for f in $STATUS_FILES; do
+    [[ -r $f ]] || continue
+    via=udp; [[ $f == *tcp* ]] && via=tcp
+    awk -F, -v via=$via -v now="$now" -v access="$ACCESS" -v ct="$ct" '
+      BEGIN {
+        # "<proto> <client ip>:<client port>" -> port the client dialled
+        nct = split(ct, lines, "\n")
+        for (i = 1; i <= nct; i++) {
+          if (split(lines[i], w, " ") < 4) continue
+          src = ""; sport = ""; dport = ""
+          for (j = 1; j in w; j++) {
+            if (w[j] ~ /^src=/ && src == "") src = substr(w[j], 5)
+            else if (w[j] ~ /^sport=/ && sport == "") sport = substr(w[j], 7)
+            else if (w[j] ~ /^dport=/ && dport == "") dport = substr(w[j], 7)
+          }
+          if (src != "") dialled[w[1] " " src ":" sport] = dport
+          delete w
+        }
+        while ((getline line < access) > 0) {
+          n = split(line, a, /[ \t]+/)
+          if (n >= 3 && a[1] !~ /^#/) reach[a[1]] = a[3] " " a[4]
+        }
+      }
+      function mb(b) { return sprintf("%.1f MB", b / 1048576) }
+      function dur(s,  d, h, m) {
+        d = int(s / 86400); h = int(s % 86400 / 3600); m = int(s % 3600 / 60)
+        return d ? sprintf("%dd%02dh", d, h) : sprintf("%dh%02dm", h, m)
+      }
+      $1 == "CLIENT_LIST" {
+        from = $3; sub(/:[0-9]+$/, "", from)
+        key = via " " $3
+        port = ((key in dialled) ? dialled[key] : "?") "/" via
+        user = ($10 != "" && $10 != "UNDEF") ? $10 : $2
+        r = (user in reach) ? reach[user] : "-"
+        # Bytes Received is from the client (its upload), Bytes Sent is to it
+        printf "%-22s %-8s %-16s %-14s %-17s %-9s %9s %9s  %s\n",
+          user, port, from, $4, substr($8, 1, 16), dur(now - $9), mb($6), mb($7), r
+        count++
+      }
+      END { exit count ? 0 : 1 }' "$f" && found=1
+  done
+  [[ -n $found ]] || echo "(nobody connected)"
+  for f in $STATUS_FILES; do
+    [[ -r $f ]] || { echo "showvpn: no status file $f (is a server running?)" >&2; continue; }
+    (( now - $(stat -c %Y "$f") > 90 )) && echo "showvpn: $f is stale - is its server running?" >&2
+  done
+  found=""
+}
+
+# Attempts logged by rc.openvpn (prefix OVPN-TRY), one line per address and port
+attempts_filter() {
+  awk -v wl="$WHITELIST" -v mode="$1" '
+    BEGIN { while ((getline l < wl) > 0) { split(l, a, ":"); ok[a[1]] = 1 } }
+    {
+      src = ""; dpt = ""; proto = ""
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^SRC=/) src = substr($i, 5)
+        else if ($i ~ /^DPT=/) dpt = substr($i, 5)
+        else if ($i ~ /^PROTO=/) proto = tolower(substr($i, 7))
+      }
+      if (src == "") next
+      t = $1; sub(/[+-][0-9][0-9]:?[0-9][0-9]$/, "", t); sub(/T/, " ", t)
+      allowed = (src in ok) ? "allowed" : "NOT ALLOWED"
+      if (mode == "live") { printf "%s  %-16s %-8s %s\n", t, src, dpt "/" proto, allowed; fflush(); next }
+      k = src " " dpt "/" proto
+      if (!(k in first)) { first[k] = t; order[++n] = k }
+      last[k] = t; cnt[k]++; st[k] = allowed
+    }
+    END {
+      if (mode == "live") exit
+      if (!n) { print "(no attempts logged)"; exit }
+      printf "%-16s %-8s %6s  %-19s  %-19s  %s\n", "FROM", "PORT", "TRIES", "FIRST", "LAST", "WHITELIST"
+      for (i = 1; i <= n; i++) {
+        split(order[i], f, " ")
+        printf "%-16s %-8s %6d  %-19s  %-19s  %s\n", f[1], f[2], cnt[order[i]], first[order[i]], last[order[i]], st[order[i]]
+      }
+    }'
+}
+
+case ${1:-} in
+  -a) journalctl -k --no-pager -o short-iso --since "${2:-today}" -g 'OVPN-TRY' 2>/dev/null | attempts_filter summary ;;
+  -f) echo "watching VPN connection attempts (Ctrl-C to stop)..."
+      journalctl -k -f -n 0 -o short-iso -g 'OVPN-TRY' 2>/dev/null | attempts_filter live ;;
+  -w) while :; do clear; date; echo; show; sleep 5; done ;;
+  "") show ;;
+  *) sed -n '3,14s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac
