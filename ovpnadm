@@ -11,10 +11,12 @@
 #                                   --purge also deletes a VPN-only account
 #   passwd <user> [--password-stdin] set a new password (random unless given on stdin)
 #   kick <user>                     disconnect a user's sessions now
-#   client list                     client certificates and their expiry  (CLIENT_CERTS=yes)
-#   client add <name> [days] [file] issue a certificate and write its .ovpn profile
-#   client renew <name> [days] [file] replace a certificate (the old profile stops working)
+#   client list                     client certificates, expiry and renewal rules (CLIENT_CERTS=yes)
+#   client add <name> [opts]        issue a certificate and write its .ovpn profile
+#   client renew <name> [opts]      replace a certificate (the old profile stops working)
+#   client set <name> [opts]        change a client's renewal period / access-until date
 #   client revoke <name>            revoke a certificate and drop its sessions
+#     opts: --days N (default CERT_DAYS), --until YYYY-MM-DD (hard end), --no-end, --out file
 #   profile [file]                  write the shared .ovpn profile          (CLIENT_CERTS=no)
 #   rotate-key                      new tls-crypt key: every issued .ovpn stops working
 #   log [lines] [-f]                server log
@@ -41,6 +43,7 @@ UNIT=openvpn-server@server
 STATUS=${OVPNADM_STATUS:-/var/log/openvpn/status.log}
 MGMT=${OVPNADM_MGMT:-/run/openvpn-server/mgmt.sock}
 WL_MAP=${OVPNADM_WLMAP:-/var/lib/ovpnadm/whitelist-users}   # whitelist entry -> user records
+CLIENTS_DB=${OVPNADM_CLIENTS:-/var/lib/ovpnadm/clients}    # per-client renewal period and end date
 KEYS="ca.crt server.crt server.key tc.key crl.pem easy-rsa"
 CONF_KEYS="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
 
@@ -446,6 +449,37 @@ cmd_kick() {
 }
 
 # --- client certificates ----------------------------------------------------
+#
+# Each client has a policy in $CLIENTS_DB: "name period until"
+#   period  days a certificate is issued for (default CERT_DAYS)
+#   until   access-until date YYYY-MM-DD, or "-": no certificate, however it is
+#           renewed, runs past the end of that day
+
+pol_get() {
+  local p; p=$(awk -v n="$1" '$1 == n {print $2, $3}' "$CLIENTS_DB" 2>/dev/null)
+  echo "${p:-$CERT_DAYS -}"
+}
+pol_set() {
+  mkdir -p "${CLIENTS_DB%/*}"
+  { awk -v n="$1" '$1 != n' "$CLIENTS_DB" 2>/dev/null; echo "$1 $2 $3"; } > "$CLIENTS_DB.tmp" && mv "$CLIENTS_DB.tmp" "$CLIENTS_DB"
+}
+pol_del() { [[ -f $CLIENTS_DB ]] && { awk -v n="$1" '$1 != n' "$CLIENTS_DB" > "$CLIENTS_DB.tmp"; mv "$CLIENTS_DB.tmp" "$CLIENTS_DB"; }; return 0; }
+
+valid_days() { [[ $1 =~ ^[1-9][0-9]{0,4}$ ]] || die "days must be a number from 1 to 99999: '$1'"; }
+valid_date() {
+  [[ $1 =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && date -d "$1" >/dev/null 2>&1 || die "date must be YYYY-MM-DD: '$1'"
+  (( $(date -d "$1 23:59:59" +%s) > $(date +%s) )) || die "$1 is in the past"
+}
+
+# Days to issue for: the period, cut short by the access-until date
+issue_days() {
+  local period=$1 until=$2 left
+  [[ $until == - ]] && { echo "$period"; return; }
+  # Whole days from now that still end before $until is over (rounding up would overshoot)
+  left=$(( ($(date -d "$until 23:59:59" +%s) - $(date +%s)) / 86400 ))
+  (( left >= 1 )) || die "access ends on $until - too soon to issue a certificate"
+  echo $(( period < left ? period : left ))
+}
 
 # name, state, expiry date, days left - for valid certificates (server excluded)
 client_certs() {
@@ -458,34 +492,79 @@ client_certs() {
   done | sort
 }
 
+# Options for add/renew/set: --days N, --until YYYY-MM-DD, --no-end, --out FILE
+client_opts() {
+  O_DAYS="" O_UNTIL="" O_OUT=""
+  while (( $# )); do
+    case $1 in
+      --days)   valid_days "${2:-}"; O_DAYS=$2; shift 2 ;;
+      --until)  valid_date "${2:-}"; O_UNTIL=$2; shift 2 ;;
+      --no-end) O_UNTIL=-; shift ;;
+      --out)    [[ -n ${2:-} ]] || usage; O_OUT=$2; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+}
+
 cmd_client() {
   need_installed
   local sub=${1:-list}; shift || true
   case $sub in
     list)
-      local rows; rows=$(client_certs)
+      local rows name state exp left period until
+      rows=$(client_certs)
       [[ -n $rows ]] || { echo "No client certificates."; return 0; }
-      { echo "CLIENT STATE EXPIRES DAYS-LEFT"; echo "$rows"; } | column -t
+      {
+        echo "CLIENT STATE EXPIRES DAYS-LEFT RENEWS-FOR ACCESS-UNTIL"
+        while read -r name state exp left; do
+          read -r period until <<< "$(pol_get "$name")"
+          echo "$name $state $exp $left ${period}d $until"
+        done <<< "$rows"
+      } | column -t
       ;;
     add|renew)
-      local name=${1:-} days=${2:-$CERT_DAYS} out=${3:-}
+      local name=${1:-} period until days exists=""
       [[ -n $name ]] || usage
-      valid_client "$name"
-      [[ $days =~ ^[1-9][0-9]{0,4}$ ]] || die "days must be a number"
+      valid_client "$name"; shift
+      client_opts "$@"
       certs_mode || die "the server uses one shared profile (CLIENT_CERTS=no); use 'ovpnadm profile'"
-      local exists=""; [[ -f $PKI/issued/$name.crt ]] && exists=1
+      [[ -f $PKI/issued/$name.crt ]] && exists=1
       if [[ $sub == add && -n $exists ]]; then
         die "client $name already has a certificate; use 'client renew $name' to replace it"
       fi
+      [[ $sub == renew && -z $exists ]] && die "no certificate for client $name; use 'client add $name'"
+      read -r period until <<< "$(pol_get "$name")"
+      period=${O_DAYS:-$period}
+      until=${O_UNTIL:-$until}
+      days=$(issue_days "$period" "$until") || exit 1
       if [[ -n $exists ]]; then
         easyrsa revoke "$name" || die "could not revoke the old certificate for $name"
         drop_sessions cert "$name" || true
       fi
       EASYRSA_CERT_EXPIRE=$days easyrsa build-client-full "$name" nopass || die "could not issue a certificate for $name"
       update_crl
+      pol_set "$name" "$period" "$until"
       echo "issued certificate $name, valid $days days (until $(date -d "+$days days" +%F))"
+      (( days < period )) && echo "shortened from $period days by the access-until date $until"
+      echo "renewals: $period days each$( [[ $until != - ]] && echo ", never past $until")"
       [[ -n $exists ]] && echo "the previous certificate for $name is revoked"
-      write_profile "${out:-$name.ovpn}" "$name"
+      write_profile "${O_OUT:-$name.ovpn}" "$name"
+      ;;
+    set)
+      local name=${1:-} period until exp
+      [[ -n $name ]] || usage
+      valid_client "$name"; shift
+      client_opts "$@"
+      [[ -n $O_DAYS$O_UNTIL && -z $O_OUT ]] || usage
+      [[ -f $PKI/issued/$name.crt ]] || die "no certificate for client $name"
+      read -r period until <<< "$(pol_get "$name")"
+      pol_set "$name" "${O_DAYS:-$period}" "${O_UNTIL:-$until}"
+      read -r period until <<< "$(pol_get "$name")"
+      echo "$name: renewals $period days each$( [[ $until != - ]] && echo ", never past $until")"
+      exp=$(client_certs | awk -v n="$name" '$1 == n {print $3}')
+      if [[ $until != - && -n $exp && $exp > $until ]]; then
+        echo "note: the current certificate runs until $exp, past $until - renew it now to cut it short"
+      fi
       ;;
     revoke)
       local name=${1:-}; [[ -n $name ]] || usage
@@ -493,6 +572,7 @@ cmd_client() {
       [[ -f $PKI/issued/$name.crt ]] || die "no certificate for client $name"
       easyrsa revoke "$name" || die "could not revoke $name"
       update_crl
+      pol_del "$name"
       echo "revoked $name - its profile no longer works"
       drop_sessions cert "$name" && echo "disconnected $name"
       return 0

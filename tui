@@ -35,9 +35,11 @@ pick_user() {
 # Pick a client certificate; prints the name
 pick_client() {
   local items=() name state exp left
-  while read -r name state exp left; do
+  local period until
+  while read -r name state exp left period until; do
     [[ $name == CLIENT || $name == No ]] && continue
-    items+=("$name" "$state, expires $exp ($left days)")
+    [[ $until == - ]] && until="" || until=", access until $until"
+    items+=("$name" "$state, expires $exp ($left days), renews $period$until")
   done < <("$ADM" client list)
   (( ${#items[@]} )) || { msg "$1" "There are no client certificates yet."; return 1; }
   dlg --title "$1" --menu "Choose a client:" 0 70 0 "${items[@]}"
@@ -100,29 +102,62 @@ save_profile() {
   echo "$out"
 }
 
+# Ask how long a client's certificates last; prints ovpnadm options
+# (--days N and/or --until DATE). $2: current "period until", if any.
+pick_validity() {
+  local title=$1 cur=${2:-} def c v
+  def=$(setting CERT_DAYS)
+  c=$(dlg --title "$title" --default-item "${cur%% *}" --menu \
+      "How long should each certificate last?\n(renewals use the same period)" 0 60 0 \
+      30 "30 days" 60 "60 days" 90 "90 days" 365 "1 year" \
+      days "Other number of days (default $def)" \
+      date "Until a specific date") || return 1
+  case $c in
+    days) v=$(dlg --title "$title" --inputbox "Number of days:" 0 40 "$def") || return 1; echo "--days $v" ;;
+    date) v=$(dlg --title "$title" --inputbox "Last day of access (YYYY-MM-DD):" 0 50 "$(date -d '+90 days' +%F)") || return 1
+          echo "--until $v --days $(( ($(date -d "$v" +%s 2>/dev/null || echo 0) - $(date +%s)) / 86400 + 1 ))" ;;
+    *) echo "--days $c" ;;
+  esac
+  [[ $c == date ]] && return 0
+  # Optional hard end date on top of the period
+  if dlg --title "$title" --defaultno --yes-label "Set end date" --no-label "No end date" --yesno \
+      "Should access end on a fixed date, no matter how it is renewed?" 0 0; then
+    v=$(dlg --title "$title" --inputbox "Last day of access (YYYY-MM-DD):" 0 50 "$(date -d '+1 year' +%F)") || return 1
+    echo "--until $v"
+  else
+    echo "--no-end"
+  fi
+}
+
 clients_menu() {
-  local c name days out
+  local c name opts out cur
   while :; do
     c=$(dlg --title "Client certificates" --cancel-label Back --menu \
-        "Each person gets their own .ovpn. Its certificate expires after the\nchosen number of days; revoke it to cut them off at once." 0 70 0 \
-        list "Show certificates and expiry" \
+        "Each person gets their own .ovpn. Its certificate lasts the chosen\nperiod and can be renewed, never past an optional end date.\nRevoke it to cut someone off at once." 0 72 0 \
+        list "Show certificates, expiry and renewal rules" \
         add "Issue a certificate and .ovpn" \
-        renew "Replace a certificate (new .ovpn)" \
+        renew "Renew a certificate (new .ovpn)" \
+        set "Change a client's period or end date" \
         revoke "Revoke a certificate") || return
     case $c in
       list) show "Client certificates" client list ;;
       add)
         name=$(dlg --title "New client" --inputbox "Client name (who will use it, e.g. jane-laptop):" 0 60) || continue
         [[ -n $name ]] || continue
-        days=$(dlg --title "New client" --inputbox "Valid for how many days?" 0 50 "$(setting CERT_DAYS)") || continue
+        opts=$(pick_validity "New client $name") || continue
         out=$(save_profile "New client" "$name") || continue
-        show "New client" client add "$name" "$days" "$out" ;;
+        # shellcheck disable=SC2086
+        show "New client" client add "$name" $(tr '\n' ' ' <<< "$opts") --out "$out" ;;
       renew)
         name=$(pick_client "Renew certificate") || continue
-        days=$(dlg --title "Renew $name" --inputbox "Valid for how many days?" 0 50 "$(setting CERT_DAYS)") || continue
         out=$(save_profile "Renew $name" "$name") || continue
-        dlg --title "Renew $name" --yesno "The current .ovpn for $name will stop working. Continue?" 0 0 &&
-          show "Renew $name" client renew "$name" "$days" "$out" ;;
+        dlg --title "Renew $name" --yesno "Issue a new certificate for $name with its current rules?\nThe current .ovpn will stop working." 0 0 &&
+          show "Renew $name" client renew "$name" --out "$out" ;;
+      set)
+        name=$(pick_client "Change renewal rules") || continue
+        opts=$(pick_validity "Rules for $name") || continue
+        # shellcheck disable=SC2086
+        show "Rules for $name" client set "$name" $(tr '\n' ' ' <<< "$opts") ;;
       revoke)
         name=$(pick_client "Revoke certificate") || continue
         dlg --title "Revoke $name" --defaultno --yesno "Revoke $name? Their .ovpn stops working immediately." 0 0 &&

@@ -35,10 +35,12 @@ the default route, public IP, LAN from the other interface).
 ```
 sudo ovpnadm install                 # set up / apply /etc/ovpnadm.conf
 sudo ovpnadm add jane                # VPN user; prints a random password
-sudo ovpnadm client add jane-laptop  # her personal .ovpn, valid CERT_DAYS
-sudo ovpnadm client add vendor 30    # ... or valid 30 days
-sudo ovpnadm client list             # certificates and days left
+sudo ovpnadm client add jane-laptop  # her personal .ovpn, 90 days (CERT_DAYS)
+sudo ovpnadm client add vendor --days 30 --until 2027-03-31
+                                     # 30-day certificates, never past 31 March
+sudo ovpnadm client list             # expiry, days left, renewal rules
 sudo ovpnadm client renew jane-laptop
+sudo ovpnadm client set vendor --until 2027-06-30   # extend the end date
 sudo ovpnadm client revoke vendor    # stops working immediately
 sudo ovpnadm status                  # who is connected
 sudo ovpnadm users                   # VPN users, sessions, last login
@@ -53,9 +55,20 @@ Run `ovpnadm help` for everything.
 
 ## Expiry and rotation
 
+Every personal profile has two rules, set when it is issued and changed with
+`client set`:
+
+- **period** (`--days`, default `CERT_DAYS` = 90): how long each certificate
+  lasts. Typical: 30, 60, 90 or 365.
+- **access-until date** (`--until YYYY-MM-DD`, optional): no certificate, however
+  it is renewed, runs past the end of that day. `--no-end` removes it.
+
+A certificate is cut short to end before the access-until date. Moving the date
+earlier takes effect at the next renewal, so renew right away to apply it now.
+
 | What | How it ends | Effect |
 |---|---|---|
-| Personal profile | its certificate expires (`CERT_DAYS`), or `client revoke` | that one file stops working |
+| Personal profile | its certificate expires, or `client revoke` | that one file stops working |
 | Every profile | `rotate-key` (new tls-crypt key) | all files stop working, everyone reconnects with a new one |
 | Password | `ovpnadm passwd <user>` | that user needs the new password |
 
@@ -121,6 +134,7 @@ sudo ovpnadm client add <name>       # one per person
 | `/etc/pam.d/openvpn` | login check (password + group) |
 | `/run/openvpn-server/mgmt.sock` | management socket (root only) |
 | `/var/lib/ovpnadm/whitelist-users` | which users each whitelist address is for |
+| `/var/lib/ovpnadm/clients` | each client's renewal period and access-until date |
 
 ## License
 
