@@ -200,6 +200,7 @@ persist-tun
 remote-cert-tls server
 verify-x509-name server name
 auth-user-pass
+$( [[ -z $name ]] && printf '%s\n%s' '# no client certificate (OpenVPN Connect on Windows needs this)' 'setenv CLIENT_CERT 0' )
 auth SHA256
 data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305
 reneg-sec 0
