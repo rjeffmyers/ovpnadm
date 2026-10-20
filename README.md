@@ -79,6 +79,42 @@ end it right away (`client revoke` does this for you).
 `client list` shows days left. Renew before expiry to hand over a new file
 without a gap.
 
+## Self-service web page
+
+With `PORTAL=yes` (then `ovpnadm install`), connected users can open
+`http://10.8.0.1:8080/` (the first address of `VPN_POOL`) and:
+
+- see their profile's expiry, renewal period and access-until date,
+- **renew** their profile: from `RENEW_WINDOW` (14) days before expiry, for
+  their own period, never past their access-until date. Only the admin can
+  extend that date.
+- **download** their current profile again (another device, reinstall),
+- **change their password** (at least 12 characters). This is off for accounts
+  listed in `SHARED_USERS`.
+
+How it stays safe:
+
+- It listens only on the VPN server's tunnel address, so it is not reachable
+  from the internet or the LAN.
+- The user is identified by the VPN address the request comes from, which
+  OpenVPN ties to their session. There is no separate login to attack. Every
+  action also asks for the current password, and 5 wrong passwords lock that
+  address out for 15 minutes.
+- The web process runs as the unprivileged `ovpnadm-portal` user and can only
+  run `sudo ovpnadm self ...`, which works out the identity again by itself.
+- Actions are logged: `journalctl -t ovpnadm-portal`.
+- Plain HTTP is intentional: the traffic already runs inside the encrypted
+  tunnel, and a certificate for a private address would only produce browser
+  warnings.
+
+Your firewall must accept TCP `PORTAL_PORT` from the tunnel (`tun*`) to that
+address.
+
+After a self-service renewal, the user's current connection stays up. The old
+profile no longer works for new connections, so the page tells them to import
+the new file before disconnecting. If they lose it, they can download it again
+while still connected, or the admin can run `client renew`.
+
 ## Firewall
 
 ovpnadm does not change the firewall. You need to:
@@ -135,6 +171,8 @@ sudo ovpnadm client add <name>       # one per person
 | `/run/openvpn-server/mgmt.sock` | management socket (root only) |
 | `/var/lib/ovpnadm/whitelist-users` | which users each whitelist address is for |
 | `/var/lib/ovpnadm/clients` | each client's renewal period and access-until date |
+| `/usr/lib/ovpnadm/portal` | the self-service web page (service `ovpnadm-portal`) |
+| `/etc/sudoers.d/ovpnadm-portal` | lets the portal run `ovpnadm self` only |
 
 ## License
 

@@ -2,7 +2,7 @@ Package: ovpnadm
 Version: @VERSION@
 Architecture: all
 Maintainer: rjeffmyers <rjeffmyers@users.noreply.github.com>
-Depends: bash (>= 5), openvpn (>= 2.5), easy-rsa (>= 3), dialog, netcat-openbsd, openssl, iproute2, passwd, bsdextrautils | util-linux (<< 2.36)
+Depends: bash (>= 5), openvpn (>= 2.5), easy-rsa (>= 3), dialog, netcat-openbsd, python3 (>= 3.9), sudo, openssl, iproute2, passwd, bsdextrautils | util-linux (<< 2.36)
 Section: admin
 Priority: optional
 Description: OpenVPN server setup and user management with local Linux accounts
@@ -11,4 +11,6 @@ Description: OpenVPN server setup and user management with local Linux accounts
  with a personal, expiring client certificate per person.
  .
  It provides a dialog menu and a command line to manage users, client
- certificates, connected sessions, logs and the client .ovpn profiles.
+ certificates, connected sessions, logs and the client .ovpn profiles, and
+ an optional self-service web page, reachable only through the VPN, where
+ users renew their profile and change their password.

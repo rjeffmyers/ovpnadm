@@ -27,12 +27,15 @@
 #   whitelist remove-user <user> [--dry-run] remove a user's addresses (shared ones are kept)
 #   backup <file>                   save the keys, so a rebuilt server accepts existing profiles
 #   config [set <KEY> <value>]      show or change settings
+#   self info|profile|renew|passwd <vpn-ip>   self-service actions (used by the web portal)
 #
 # Users log in with their Linux username and password and must be in the VPN
 # group. With CLIENT_CERTS=yes each person also needs their own .ovpn, whose
 # certificate expires after CERT_DAYS; with CLIENT_CERTS=no everyone shares one.
 
 VERSION=1.0.0
+
+PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
 
 CONF_FILE=${OVPNADM_CONF:-/etc/ovpnadm.conf}
 LIBDIR=${OVPNADM_LIB:-/usr/lib/ovpnadm}
@@ -45,7 +48,7 @@ MGMT=${OVPNADM_MGMT:-/run/openvpn-server/mgmt.sock}
 WL_MAP=${OVPNADM_WLMAP:-/var/lib/ovpnadm/whitelist-users}   # whitelist entry -> user records
 CLIENTS_DB=${OVPNADM_CLIENTS:-/var/lib/ovpnadm/clients}    # per-client renewal period and end date
 KEYS="ca.crt server.crt server.key tc.key crl.pem easy-rsa"
-CONF_KEYS="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
+CONF_KEYS="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS PORTAL PORTAL_PORT RENEW_WINDOW SHARED_USERS"
 
 die() { echo "ovpnadm: $*" >&2; exit 1; }
 say() { echo "==> $*"; }
@@ -60,6 +63,7 @@ default_lan() { ip -4 route show proto kernel scope link 2>/dev/null | awk -v ex
 
 load_conf() {
   EXT_IF="" PUBLIC_IP="" LAN_NET="" VPN_POOL="" PORT="" VPN_GROUP="" PROFILE_NAME="" CLIENT_CERTS="" CERT_DAYS=""
+  PORTAL="" PORTAL_PORT="" RENEW_WINDOW="" SHARED_USERS=""
   # shellcheck disable=SC1090
   [[ -f $CONF_FILE ]] && . "$CONF_FILE"
   EXT_IF=${EXT_IF:-$(default_if)}
@@ -71,15 +75,21 @@ load_conf() {
   PROFILE_NAME=${PROFILE_NAME:-$(hostname -s)-vpn}
   CLIENT_CERTS=${CLIENT_CERTS:-yes}
   CERT_DAYS=${CERT_DAYS:-90}
+  PORTAL=${PORTAL:-no}
+  PORTAL_PORT=${PORTAL_PORT:-8080}
+  RENEW_WINDOW=${RENEW_WINDOW:-14}
 }
 
 cmd_config() {
   if [[ ${1:-} == set ]]; then
     local key=${2:-} val=${3-}
     [[ " $CONF_KEYS " == *" $key "* ]] || die "unknown setting '$key' (one of: $CONF_KEYS)"
-    [[ $val =~ ^[A-Za-z0-9._/:-]*$ ]] || die "invalid value for $key: '$val'"
+    [[ $val =~ ^[A-Za-z0-9._/:,-]*$ ]] || die "invalid value for $key: '$val'"
     [[ $key != CLIENT_CERTS || $val =~ ^(yes|no)$ ]] || die "CLIENT_CERTS must be yes or no"
     [[ $key != CERT_DAYS || $val =~ ^[1-9][0-9]{0,4}$ ]] || die "CERT_DAYS must be a number of days"
+    [[ $key != PORTAL || $val =~ ^(yes|no)$ ]] || die "PORTAL must be yes or no"
+    [[ $key != PORTAL_PORT || $val =~ ^[1-9][0-9]{0,4}$ ]] || die "PORTAL_PORT must be a port number"
+    [[ $key != RENEW_WINDOW || $val =~ ^[0-9]{1,4}$ ]] || die "RENEW_WINDOW must be a number of days"
     [[ -f $CONF_FILE ]] || : > "$CONF_FILE"
     if grep -q "^$key=" "$CONF_FILE"; then
       sed -i "s|^$key=.*|$key=$val|" "$CONF_FILE"
@@ -174,12 +184,11 @@ update_crl() {
   install -m 644 $PKI/crl.pem $D/crl.pem
 }
 
-# Write a client profile; with a client name, embed that client's certificate and key
-write_profile() {
-  local out=$1 name=${2:-} port
+# Print a client profile; with a client name, embed that client's certificate and key
+profile_text() {
+  local name=${1:-} port
   port=$(awk '$1 == "port" {print $2}' "$SERVER_CONF")
-  ( umask 077
-    cat > "$out" <<EOF
+  cat <<EOF
 client
 dev tun
 proto udp
@@ -202,13 +211,17 @@ $(cat $D/ca.crt)
 $(cat $D/tc.key)
 </tls-crypt>
 EOF
-    if [[ -n $name ]]; then
-      printf '<cert>\n%s\n</cert>\n<key>\n%s\n</key>\n' \
-        "$(openssl x509 -in "$PKI/issued/$name.crt")" "$(cat "$PKI/private/$name.key")" >> "$out"
-    fi
-  ) || die "could not write $out"
+  if [[ -n $name ]]; then
+    printf '<cert>\n%s\n</cert>\n<key>\n%s\n</key>\n' \
+      "$(openssl x509 -in "$PKI/issued/$name.crt")" "$(cat "$PKI/private/$name.key")"
+  fi
+}
+
+write_profile() {
+  local out=$1 name=${2:-}
+  ( umask 077; profile_text "$name" > "$out" ) || die "could not write $out"
   [[ -n ${SUDO_USER:-} ]] && chown "$SUDO_USER": "$out" 2>/dev/null
-  echo "wrote $out (connects to $PUBLIC_IP:${port:-1194}/udp)"
+  echo "wrote $out (connects to $PUBLIC_IP:$(awk '$1 == "port" {print $2}' "$SERVER_CONF")/udp)"
 }
 
 # --- install ----------------------------------------------------------------
@@ -348,6 +361,7 @@ EOF
   sleep 2
   systemctl is-active --quiet $UNIT || die "the server failed to start: journalctl -u $UNIT"
   say "$UNIT running and enabled at boot"
+  setup_portal "$pool_net"
   echo
   if [[ $CLIENT_CERTS == yes ]]; then
     echo "Next: add users (ovpnadm add <user>) and give each person a profile (ovpnadm client add <name>)."
@@ -356,6 +370,53 @@ EOF
   fi
   echo "Your firewall must allow UDP $PORT in and forward $VPN_POOL to $LAN_NET, and"
   echo "hosts on $LAN_NET need a route back to $VPN_POOL (or NAT it)."
+}
+
+# Self-service web portal: only on the VPN server's own tunnel address
+setup_portal() {
+  local unit=/etc/systemd/system/ovpnadm-portal.service sudoers=/etc/sudoers.d/ovpnadm-portal
+  if [[ $PORTAL != yes ]]; then
+    if [[ -f $unit ]]; then
+      systemctl disable --now ovpnadm-portal >/dev/null 2>&1
+      rm -f "$unit" "$sudoers"; systemctl daemon-reload
+      say "self-service portal removed"
+    fi
+    return 0
+  fi
+  local adm=/usr/sbin/ovpnadm addr
+  [[ -x $adm && -f $LIBDIR/portal ]] || die "the portal needs the ovpnadm package installed (/usr/sbin/ovpnadm, $LIBDIR/portal)"
+  addr=${1%.*}.$(( ${1##*.} + 1 ))   # the server's address in VPN_POOL
+  getent passwd ovpnadm-portal >/dev/null ||
+    useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ovpnadm-portal
+  echo "ovpnadm-portal ALL=(root) NOPASSWD: $adm self *" > "$sudoers.tmp"
+  chmod 440 "$sudoers.tmp"
+  visudo -cqf "$sudoers.tmp" || { rm -f "$sudoers.tmp"; die "bad sudoers rule"; }
+  mv "$sudoers.tmp" "$sudoers"
+  cat > "$unit" <<EOF
+# Written by ovpnadm install (PORTAL=yes)
+[Unit]
+Description=ovpnadm self-service portal (VPN clients only)
+After=$UNIT.service
+Wants=$UNIT.service
+
+[Service]
+User=ovpnadm-portal
+ExecStart=/usr/bin/python3 $LIBDIR/portal --bind $addr --port $PORTAL_PORT --pool $VPN_POOL --adm $adm
+Restart=always
+RestartSec=5
+PrivateTmp=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable ovpnadm-portal >/dev/null 2>&1
+  systemctl restart ovpnadm-portal
+  sleep 1
+  systemctl is-active --quiet ovpnadm-portal || die "the portal failed to start: journalctl -u ovpnadm-portal"
+  say "self-service portal on http://$addr:$PORTAL_PORT/ (reachable only through the VPN)"
+  echo "    your firewall must accept TCP $PORTAL_PORT from the tunnel to $addr"
 }
 
 # --- users ------------------------------------------------------------------
@@ -492,6 +553,17 @@ client_certs() {
   done | sort
 }
 
+# (Re)issue the certificate for $1, valid $2 days. $3 = "drop": disconnect
+# sessions using the old one (self-service renewal keeps the caller connected).
+issue_cert() {
+  if [[ -f $PKI/issued/$1.crt ]]; then
+    easyrsa revoke "$1" || die "could not revoke the old certificate for $1"
+    [[ ${3:-} == drop ]] && { drop_sessions cert "$1" || true; }
+  fi
+  EASYRSA_CERT_EXPIRE=$2 easyrsa build-client-full "$1" nopass || die "could not issue a certificate for $1"
+  update_crl
+}
+
 # Options for add/renew/set: --days N, --until YYYY-MM-DD, --no-end, --out FILE
 client_opts() {
   O_DAYS="" O_UNTIL="" O_OUT=""
@@ -537,12 +609,7 @@ cmd_client() {
       period=${O_DAYS:-$period}
       until=${O_UNTIL:-$until}
       days=$(issue_days "$period" "$until") || exit 1
-      if [[ -n $exists ]]; then
-        easyrsa revoke "$name" || die "could not revoke the old certificate for $name"
-        drop_sessions cert "$name" || true
-      fi
-      EASYRSA_CERT_EXPIRE=$days easyrsa build-client-full "$name" nopass || die "could not issue a certificate for $name"
-      update_crl
+      issue_cert "$name" "$days" drop
       pol_set "$name" "$period" "$until"
       echo "issued certificate $name, valid $days days (until $(date -d "+$days days" +%F))"
       (( days < period )) && echo "shortened from $period days by the access-until date $until"
@@ -614,6 +681,10 @@ cmd_status() {
   lines=$(client_lines)
   n=$(grep -c . <<< "$lines")
   echo "Server running on port $(awk '$1 == "port" {print $2}' "$SERVER_CONF"), $(certs_mode && echo "per-client certificates" || echo "shared profile") - $n client(s) connected ($src)"
+  if [[ -f /etc/systemd/system/ovpnadm-portal.service ]]; then
+    local url; url=$(sed -n 's/.*--bind \([^ ]*\) --port \([^ ]*\).*/http:\/\/\1:\2\//p' /etc/systemd/system/ovpnadm-portal.service)
+    echo "Self-service portal: $url ($(systemctl is-active ovpnadm-portal))"
+  fi
   (( n > 0 )) || return 0
   echo
   {
@@ -666,6 +737,132 @@ auth_events() {
 }
 
 # --- whitelist and backup ---------------------------------------------------
+
+# --- self-service (called by the web portal through sudo) -------------------
+#
+# self info <vpn-ip>               who is on this VPN address and what they may do
+# self profile <vpn-ip>            their current .ovpn on stdout       stdin: password
+# self renew <vpn-ip>              renew their certificate, new .ovpn   stdin: password
+# self passwd <vpn-ip>             change their password       stdin: password, new password
+#
+# The caller is identified only by the VPN address the request came from, which
+# OpenVPN ties to the session. Exit status 3 means the password was wrong.
+
+SELF_SESSION_USER="" SELF_SESSION_CLIENT=""
+
+# Find the session on VPN address $1
+self_session() {
+  local ip=$1 line
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || die "bad address"
+  ip_in "$ip" "$VPN_POOL" || die "$ip is not a VPN address"
+  line=$(client_lines | awk -F, -v ip="$ip" '$4 == ip' | head -1)
+  [[ -n $line ]] || die "no VPN session on $ip"
+  SELF_SESSION_CLIENT=$(cut -d, -f2 <<< "$line")
+  SELF_SESSION_USER=$(cut -d, -f10 <<< "$line")
+  [[ -z $SELF_SESSION_USER || $SELF_SESSION_USER == UNDEF ]] && SELF_SESSION_USER=$SELF_SESSION_CLIENT
+  valid_user "$SELF_SESSION_USER"
+  certs_mode || SELF_SESSION_CLIENT=""
+  return 0
+}
+
+# Check the password on stdin (first line) against the session user
+self_auth() {
+  local pw
+  IFS= read -r pw || true
+  if [[ -z $pw ]] || ! printf '%s\0' "$pw" | unix_chkpwd "$SELF_SESSION_USER" nonull >/dev/null 2>&1; then
+    logger -t ovpnadm-portal "wrong password for $SELF_SESSION_USER from $1"
+    echo "ovpnadm: wrong password" >&2
+    exit 3
+  fi
+}
+
+is_shared() { [[ ",$SHARED_USERS," == *",$1,"* ]]; }
+
+# Renewal check for the session's client: prints "yes <new-days>" or "no <reason>"
+self_renew_check() {
+  local name=$SELF_SESSION_CLIENT exp left period until days
+  [[ -n $name ]] || { echo "no this server uses one shared profile"; return; }
+  [[ -f $PKI/issued/$name.crt ]] || { echo "no your certificate was revoked"; return; }
+  read -r _ _ exp left <<< "$(client_certs | awk -v n="$name" '$1 == n')"
+  read -r period until <<< "$(pol_get "$name")"
+  if [[ $until != - ]] && (( ($(date -d "$until 23:59:59" +%s) - $(date +%s)) / 86400 < 1 )); then
+    echo "no your access ends on $until - ask your administrator"; return
+  fi
+  days=$(issue_days "$period" "$until" 2>/dev/null) || { echo "no your access ends on $until"; return; }
+  if (( left > RENEW_WINDOW )); then
+    echo "no renewal opens $RENEW_WINDOW days before expiry, on $(date -d "$exp -$RENEW_WINDOW days" +%F)"; return
+  fi
+  if (( days <= left )); then
+    if (( days < period )); then
+      echo "no your certificate already runs to your access end date ($until) - ask your administrator"
+    else
+      echo "no renewing now would not give you more time - try again in a few days"
+    fi
+    return
+  fi
+  echo "yes $days"
+}
+
+cmd_self() {
+  local sub=${1:-} ip=${2:-}
+  [[ -n $sub && -n $ip ]] || usage
+  need_installed
+  self_session "$ip"
+  local user=$SELF_SESSION_USER name=$SELF_SESSION_CLIENT
+  case $sub in
+    info)
+      local exp="" left="" period="" until="" r
+      echo "user=$user"
+      echo "client=${name:--}"
+      if [[ -n $name ]]; then
+        read -r _ _ exp left <<< "$(client_certs | awk -v n="$name" '$1 == n')"
+        read -r period until <<< "$(pol_get "$name")"
+        echo "expires=${exp:--}"
+        echo "days_left=${left:--}"
+        echo "period=$period"
+        echo "until=$until"
+      fi
+      r=$(self_renew_check)
+      echo "renew=${r%% *}"
+      if [[ ${r%% *} == yes ]]; then
+        echo "renew_days=${r#* }"
+        echo "renew_expires=$(date -d "+${r#* } days" +%F)"
+      else
+        echo "renew_reason=${r#* }"
+      fi
+      if is_shared "$user"; then echo "passwd=no"; echo "passwd_reason=this is a shared account - ask your administrator"
+      else echo "passwd=yes"; fi
+      ;;
+    profile)
+      self_auth "$ip"
+      profile_text "$name"
+      logger -t ovpnadm-portal "$user (${name:-shared profile}) downloaded their profile from $ip"
+      ;;
+    renew)
+      self_auth "$ip"
+      local r days period until
+      r=$(self_renew_check)
+      [[ ${r%% *} == yes ]] || die "${r#* }"
+      days=${r#* }
+      issue_cert "$name" "$days"
+      profile_text "$name"
+      logger -t ovpnadm-portal "$user renewed $name for $days days from $ip"
+      ;;
+    passwd)
+      self_auth "$ip"
+      is_shared "$user" && die "this is a shared account - ask your administrator"
+      local new
+      IFS= read -r new || true
+      (( ${#new} >= 12 )) || die "the new password must be at least 12 characters"
+      [[ $new != *"$user"* ]] || die "the new password must not contain your user name"
+      printf '%s\0' "$new" | unix_chkpwd "$user" nonull >/dev/null 2>&1 && die "the new password must be different"
+      set_pw "$user" "$new"
+      echo "password changed"
+      logger -t ovpnadm-portal "$user changed their password from $ip"
+      ;;
+    *) usage ;;
+  esac
+}
 
 # The firewall side is done by "allowvpn" (ip | -r ip | -l). ovpnadm keeps its
 # own record of which users each whitelist entry belongs to, so entries can be
@@ -854,6 +1051,7 @@ case $cmd in
   log)        cmd_log "$@" ;;
   auth-log)   cmd_auth_log "$@" ;;
   whitelist)  cmd_whitelist "$@" ;;
+  self)       cmd_self "$@" ;;
   backup)     cmd_backup "$@" ;;
   config)     cmd_config "$@" ;;
   -h|--help|help) usage ;;

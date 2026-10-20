@@ -6,10 +6,11 @@ ROOT    := build/root
 
 deb: $(PKG)
 
-$(PKG): ovpnadm tui ovpnadm.conf debian/control debian/conffiles debian/postinst README.md LICENSE
+$(PKG): ovpnadm tui portal ovpnadm.conf debian/control debian/conffiles debian/postinst README.md LICENSE
 	rm -rf $(ROOT)
 	install -D -m 755 ovpnadm $(ROOT)/usr/sbin/ovpnadm
 	install -D -m 755 tui $(ROOT)/usr/lib/ovpnadm/tui
+	install -D -m 755 portal $(ROOT)/usr/lib/ovpnadm/portal
 	install -D -m 644 ovpnadm.conf $(ROOT)/etc/ovpnadm.conf
 	install -D -m 644 README.md $(ROOT)/usr/share/doc/ovpnadm/README.md
 	install -D -m 644 LICENSE $(ROOT)/usr/share/doc/ovpnadm/copyright
@@ -21,6 +22,7 @@ $(PKG): ovpnadm tui ovpnadm.conf debian/control debian/conffiles debian/postinst
 
 check:
 	bash -n ovpnadm && bash -n tui
+	python3 -m py_compile portal && rm -rf __pycache__
 	@command -v shellcheck >/dev/null && shellcheck -x ovpnadm tui || echo "shellcheck not installed; syntax only"
 
 clean:

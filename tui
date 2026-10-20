@@ -232,13 +232,13 @@ logs_menu() {
 }
 
 settings_menu() {
-  local vals form k i=0 lines=() keys="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS"
+  local vals form k i=0 lines=() keys="EXT_IF PUBLIC_IP LAN_NET VPN_POOL PORT VPN_GROUP PROFILE_NAME CLIENT_CERTS CERT_DAYS PORTAL PORTAL_PORT RENEW_WINDOW SHARED_USERS"
   for k in $keys; do
     i=$((i + 1))
     lines+=("$k" "$i" 1 "$(setting "$k")" "$i" 16 30 60)
   done
   form=$(dlg --title "Settings" --ok-label "Save" --form \
-      "Network and login settings (/etc/ovpnadm.conf).\nCLIENT_CERTS: yes = a personal expiring .ovpn per person, no = one shared .ovpn.\nThey take effect when you apply them (Install / apply settings)." \
+      "Network and login settings (/etc/ovpnadm.conf).\nCLIENT_CERTS: yes = a personal expiring .ovpn per person, no = one shared .ovpn.\nPORTAL: yes = self-service web page for connected users (renew, password).\nThey take effect when you apply them (Install / apply settings)." \
       0 0 0 "${lines[@]}") || return
   i=0
   while IFS= read -r v; do

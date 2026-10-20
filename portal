@@ -1,0 +1,290 @@
+#!/usr/bin/python3
+"""ovpnadm self-service portal.
+
+A small web page, reachable only through the VPN, where a connected user can
+download their profile, renew their certificate and change their password.
+
+The user is identified by the VPN address their request comes from (OpenVPN
+ties it to their session); every action also asks for their current
+password. The real work is done by "sudo ovpnadm self ...", which re-checks
+the identity itself, so this process runs unprivileged.
+
+Plain HTTP is used on purpose: the page is only reachable through the VPN
+tunnel, which already encrypts the traffic.
+"""
+
+import argparse
+import hashlib
+import hmac
+import html
+import ipaddress
+import secrets
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+FAIL_LIMIT = 5          # wrong passwords ...
+FAIL_WINDOW = 15 * 60   # ... within this many seconds lock the address out
+MAX_BODY = 4096
+
+SECRET = secrets.token_bytes(32)
+failures = {}
+failures_lock = threading.Lock()
+args = None
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def adm(cmd, ip, stdin=""):
+    """Run "ovpnadm self <cmd> <ip>"; returns (status, stdout, error message)."""
+    try:
+        r = subprocess.run(["sudo", "-n", args.adm, "self", cmd, ip], input=stdin,
+                           capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return 1, "", "the server took too long - try again"
+    err = r.stderr.strip().splitlines()
+    err = err[-1].removeprefix("ovpnadm: ") if err else ""
+    return r.returncode, r.stdout, err
+
+
+def info(ip):
+    status, out, err = adm("info", ip)
+    if status != 0:
+        return None, err
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line), ""
+
+
+def token(ip):
+    return hmac.new(SECRET, ip.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def locked_out(ip):
+    now = time.time()
+    with failures_lock:
+        recent = [t for t in failures.get(ip, []) if now - t < FAIL_WINDOW]
+        failures[ip] = recent
+        return len(recent) >= FAIL_LIMIT
+
+
+def record_failure(ip):
+    with failures_lock:
+        failures.setdefault(ip, []).append(time.time())
+
+
+STYLE = """
+:root { --bg: #f6f7f9; --card: #fff; --text: #1d2330; --muted: #5d6675; --line: #dde1e7;
+        --accent: #2457c5; --ok-bg: #e7f5ec; --ok: #1d6b3a; --err-bg: #fdecec; --err: #a12626; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #14171c; --card: #1d2128; --text: #e6e9ef; --muted: #9aa3b2; --line: #313743;
+          --accent: #7aa2ff; --ok-bg: #16321f; --ok: #8fd6a6; --err-bg: #3a1a1a; --err: #f2a3a3; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+       font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 640px; margin: 0 auto; padding: 32px 16px 48px; }
+h1 { font-size: 1.5rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 0 0 8px; }
+.sub { color: var(--muted); margin: 0 0 24px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 20px; margin-bottom: 16px; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+p { margin: 0 0 12px; }
+label { display: block; font-size: .9rem; color: var(--muted); margin: 10px 0 4px; }
+input[type=password] { width: 100%; padding: 9px 10px; font: inherit; color: var(--text);
+                       background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+button { margin-top: 14px; padding: 9px 16px; font: inherit; font-weight: 600; color: #fff;
+         background: var(--accent); border: 0; border-radius: 6px; cursor: pointer; }
+.note { color: var(--muted); font-size: .9rem; margin: 10px 0 0; }
+.msg { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; }
+.ok { background: var(--ok-bg); color: var(--ok); }
+.err { background: var(--err-bg); color: var(--err); }
+"""
+
+
+def page(body, title="VPN self-service"):
+    return ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width, initial-scale=1'>"
+            f"<title>{title}</title><style>{STYLE}</style></head>"
+            f"<body><main>{body}</main></body></html>").encode()
+
+
+def esc(s):
+    return html.escape(str(s))
+
+
+def password_field(name="password", label="Your current password", auto="current-password"):
+    return (f"<label for={name}>{label}</label>"
+            f"<input type=password id={name} name={name} required autocomplete={auto}>")
+
+
+def home(ip, message="", ok=True):
+    data, err = info(ip)
+    if data is None:
+        return page(f"<h1>VPN self-service</h1><div class='msg err'>{esc(err)}</div>")
+    t = esc(token(ip))
+    banner = f"<div class='msg {'ok' if ok else 'err'}'>{esc(message)}</div>" if message else ""
+    rows = [("User", data.get("user", "?"))]
+    if data.get("client", "-") != "-":
+        rows += [("Profile", data["client"]),
+                 ("Expires", f"{data.get('expires', '?')} ({data.get('days_left', '?')} days left)"),
+                 ("Renews for", f"{data.get('period', '?')} days")]
+        if data.get("until", "-") != "-":
+            rows.append(("Access until", data["until"]))
+    dl = "".join(f"<dt>{esc(k)}</dt><dd>{esc(v)}</dd>" for k, v in rows)
+
+    if data.get("renew") == "yes":
+        renew = (f"<p>Get a new profile valid until <b>{esc(data.get('renew_expires'))}</b>. "
+                 "Your current profile stops working once you disconnect, so <b>save the new file "
+                 "and import it before you disconnect</b>.</p>"
+                 f"<form method=post action=/renew><input type=hidden name=token value={t}>"
+                 f"{password_field('rp')}<button>Renew and download</button></form>")
+    else:
+        renew = f"<p>{esc(data.get('renew_reason', 'Renewal is not available.'))}</p>"
+
+    if data.get("passwd") == "yes":
+        passwd = (f"<form method=post action=/passwd><input type=hidden name=token value={t}>"
+                  f"{password_field('cp')}"
+                  f"{password_field('new', 'New password (at least 12 characters)', 'new-password')}"
+                  f"{password_field('new2', 'New password again', 'new-password')}"
+                  "<button>Change password</button></form>"
+                  "<p class=note>This is your VPN login password. Your current connection stays up.</p>")
+    else:
+        passwd = f"<p>{esc(data.get('passwd_reason', 'Not available.'))}</p>"
+
+    body = (f"<h1>VPN self-service</h1><p class=sub>Connected from {esc(ip)}</p>{banner}"
+            f"<section><h2>Your connection</h2><dl>{dl}</dl></section>"
+            f"<section><h2>Renew your profile</h2>{renew}</section>"
+            f"<section><h2>Download your current profile</h2>"
+            f"<p>Get your .ovpn file again, for example for another device or after reinstalling.</p>"
+            f"<form method=post action=/profile><input type=hidden name=token value={t}>"
+            f"{password_field('dp')}<button>Download</button></form></section>"
+            f"<section><h2>Change your password</h2>{passwd}</section>")
+    return page(body)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ovpnadm-portal"
+    sys_version = ""
+    timeout = 30
+
+    def log_message(self, fmt, *a):
+        log(f"{self.client_address[0]} {fmt % a}")
+
+    def client_ok(self):
+        ip = self.client_address[0]
+        try:
+            if ipaddress.ip_address(ip) in args.pool and ip != args.bind:
+                return ip
+        except ValueError:
+            pass
+        self.reply(403, page("<h1>Forbidden</h1><p>This page is only available through the VPN.</p>"))
+        return None
+
+    def reply(self, code, body, ctype="text/html; charset=utf-8", extra=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        ip = self.client_ok()
+        if not ip:
+            return
+        if self.path != "/":
+            self.reply(404, page("<h1>Not found</h1><p><a href=/>Back</a></p>"))
+            return
+        self.reply(200, home(ip))
+
+    def do_POST(self):
+        ip = self.client_ok()
+        if not ip:
+            return
+        action = self.path.strip("/")
+        if action not in ("profile", "renew", "passwd"):
+            self.reply(404, page("<h1>Not found</h1>"))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = MAX_BODY + 1
+        if length > MAX_BODY:
+            self.reply(413, page("<h1>Request too large</h1>"))
+            return
+        form = {k: v[0] for k, v in parse_qs(self.rfile.read(length).decode("utf-8", "replace")).items()}
+        if not hmac.compare_digest(form.get("token", ""), token(ip)):
+            self.reply(400, home(ip, "The form expired - please try again.", ok=False))
+            return
+        if locked_out(ip):
+            self.reply(429, home(ip, "Too many wrong passwords. Wait 15 minutes and try again.", ok=False))
+            return
+
+        pw = {"profile": "dp", "renew": "rp", "passwd": "cp"}[action]
+        stdin = form.get(pw, "").replace("\n", "") + "\n"
+        if action == "passwd":
+            new, new2 = form.get("new", ""), form.get("new2", "")
+            if new != new2:
+                self.reply(200, home(ip, "The new passwords do not match.", ok=False))
+                return
+            if "\n" in new or "\r" in new:
+                self.reply(200, home(ip, "The new password contains invalid characters.", ok=False))
+                return
+            stdin += new + "\n"
+
+        status, out, err = adm(action, ip, stdin)
+        if status == 3:
+            record_failure(ip)
+            self.reply(200, home(ip, "Wrong password.", ok=False))
+        elif status != 0:
+            self.reply(200, home(ip, err or "Something went wrong.", ok=False))
+        elif action == "passwd":
+            self.reply(200, home(ip, "Your password has been changed. Use it the next time you connect."))
+        else:
+            data, _ = info(ip)
+            name = (data or {}).get("client", "-")
+            fname = f"{name if name != '-' else 'vpn'}.ovpn"
+            self.reply(200, out.encode(), "application/x-openvpn-profile",
+                       {"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        # IP_FREEBIND: bind even while the tunnel interface does not have the address yet
+        self.socket.setsockopt(socket.SOL_IP, getattr(socket, "IP_FREEBIND", 15), 1)
+        socketserver.TCPServer.server_bind(self)   # skip HTTPServer's reverse DNS lookup
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+def main():
+    global args
+    p = argparse.ArgumentParser(description="ovpnadm self-service portal")
+    p.add_argument("--bind", required=True, help="VPN server address to listen on (e.g. 10.8.0.1)")
+    p.add_argument("--port", type=int, default=8080)
+    p.add_argument("--pool", required=True, type=ipaddress.ip_network, help="VPN client network")
+    p.add_argument("--adm", default="/usr/sbin/ovpnadm")
+    args = p.parse_args()
+    log(f"listening on http://{args.bind}:{args.port}/ for clients in {args.pool}")
+    Server((args.bind, args.port), Handler).serve_forever()
+
+
+if __name__ == "__main__":
+    main()
